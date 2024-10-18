@@ -5,6 +5,6 @@
 		"start": "cd frontend && npm start",
 		"preinstall": "cargo install -f cargo-watch wasm-pack wasm-bindgen-cli@0.2.95",
 		"postinstall:dev": "npm run preinstall && npm run start",
-		"preinstall:prod": "npm run preinstall && cargo install cargo-about && cd frontend && npm run production"
+		"preinstall:prod": "npm run preinstall && cargo install cargo-about && cd frontend && npm run build"
 	}
 }
