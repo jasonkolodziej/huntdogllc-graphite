@@ -7,15 +7,16 @@
 	import type { IconName } from "@graphite/utility-functions/icons";
 	import type { Editor } from "@graphite/wasm-communication/editor";
 	import type { Node } from "@graphite/wasm-communication/messages";
-	import type { FrontendNodeWire, FrontendNodeType, FrontendNode, FrontendGraphInput, FrontendGraphOutput, FrontendGraphDataType, WirePath } from "@graphite/wasm-communication/messages";
+	import type { FrontendNodeWire, FrontendNode, FrontendGraphInput, FrontendGraphOutput, FrontendGraphDataType, WirePath } from "@graphite/wasm-communication/messages";
 
+	import NodeCatalog from "@graphite/components/floating-menus/NodeCatalog.svelte";
 	import LayoutCol from "@graphite/components/layout/LayoutCol.svelte";
 	import LayoutRow from "@graphite/components/layout/LayoutRow.svelte";
 	import IconButton from "@graphite/components/widgets/buttons/IconButton.svelte";
 	import TextButton from "@graphite/components/widgets/buttons/TextButton.svelte";
 	import RadioInput from "@graphite/components/widgets/inputs/RadioInput.svelte";
-	import TextInput from "@graphite/components/widgets/inputs/TextInput.svelte";
 	import IconLabel from "@graphite/components/widgets/labels/IconLabel.svelte";
+	import Separator from "@graphite/components/widgets/labels/Separator.svelte";
 	import TextLabel from "@graphite/components/widgets/labels/TextLabel.svelte";
 	const GRID_COLLAPSE_SPACING = 10;
 	const GRID_SIZE = 24;
@@ -25,14 +26,12 @@
 
 	let graph: HTMLDivElement | undefined;
 	let nodesContainer: HTMLDivElement | undefined;
-	let nodeSearchInput: TextInput | undefined;
 
 	// TODO: Using this not-complete code, or another better approach, make it so the dragged in-progress connector correctly handles showing/hiding the SVG shape of the connector caps
 	// let wireInProgressFromLayerTop: bigint | undefined = undefined;
 	// let wireInProgressFromLayerBottom: bigint | undefined = undefined;
 
 	let nodeWirePaths: WirePath[] = [];
-	let searchTerm = "";
 
 	// TODO: Convert these arrays-of-arrays to a Map?
 	let inputs: SVGSVGElement[][] = [];
@@ -43,13 +42,6 @@
 
 	$: gridSpacing = calculateGridSpacing($nodeGraph.transform.scale);
 	$: dotRadius = 1 + Math.floor($nodeGraph.transform.scale - 0.5 + 0.001) / 2;
-	$: nodeCategories = buildNodeCategories($nodeGraph.nodeTypes, searchTerm);
-
-	$: (() => {
-		if ($nodeGraph.contextMenuInformation?.contextMenuData === "CreateNode") {
-			setTimeout(() => nodeSearchInput?.focus(), 0);
-		}
-	})();
 
 	$: wirePaths = createWirePaths($nodeGraph.wirePathInProgress, nodeWirePaths);
 
@@ -62,63 +54,6 @@
 		}
 
 		return sparse;
-	}
-
-	type NodeCategoryDetails = {
-		nodes: FrontendNodeType[];
-		open: boolean;
-	};
-
-	function buildNodeCategories(nodeTypes: FrontendNodeType[], searchTerm: string): [string, NodeCategoryDetails][] {
-		const categories = new Map<string, NodeCategoryDetails>();
-
-		nodeTypes.forEach((node) => {
-			let nameIncludesSearchTerm = node.name.toLowerCase().includes(searchTerm.toLowerCase());
-			// Quick and dirty hack to alias "Layer" to "Merge" in the search
-			if (node.name === "Merge") {
-				nameIncludesSearchTerm = nameIncludesSearchTerm || "Layer".toLowerCase().includes(searchTerm.toLowerCase());
-			}
-
-			if (searchTerm.length > 0 && !nameIncludesSearchTerm && !node.category.toLowerCase().includes(searchTerm.toLowerCase())) {
-				return;
-			}
-
-			const category = categories.get(node.category);
-			let open = nameIncludesSearchTerm;
-			if (searchTerm.length === 0) {
-				open = false;
-			}
-
-			if (category) {
-				category.open = open;
-				category.nodes.push(node);
-			} else
-				categories.set(node.category, {
-					open,
-					nodes: [node],
-				});
-		});
-
-		const START_CATEGORIES_ORDER = ["UNCATEGORIZED", "General", "Value", "Math", "Style"];
-		const END_CATEGORIES_ORDER = ["Debug"];
-		return Array.from(categories)
-			.sort((a, b) => a[0].localeCompare(b[0]))
-			.sort((a, b) => {
-				const aIndex = START_CATEGORIES_ORDER.findIndex((x) => a[0].startsWith(x));
-				const bIndex = START_CATEGORIES_ORDER.findIndex((x) => b[0].startsWith(x));
-				if (aIndex !== -1 && bIndex !== -1) return aIndex - bIndex;
-				if (aIndex !== -1) return -1;
-				if (bIndex !== -1) return 1;
-				return 0;
-			})
-			.sort((a, b) => {
-				const aIndex = END_CATEGORIES_ORDER.findIndex((x) => a[0].startsWith(x));
-				const bIndex = END_CATEGORIES_ORDER.findIndex((x) => b[0].startsWith(x));
-				if (aIndex !== -1 && bIndex !== -1) return aIndex - bIndex;
-				if (aIndex !== -1) return 1;
-				if (bIndex !== -1) return -1;
-				return 0;
-			});
 	}
 
 	function createWirePaths(wirePathInProgress: WirePath | undefined, nodeWirePaths: WirePath[]): WirePath[] {
@@ -298,7 +233,7 @@
 		return borderMask(boxes, nodeWidth, nodeHeight);
 	}
 
-	function layerBorderMask(nodeWidthFromThumbnail: number, nodeChainAreaLeftExtension: number): string {
+	function layerBorderMask(nodeWidthFromThumbnail: number, nodeChainAreaLeftExtension: number, hasLeftInputWire: boolean): string {
 		const NODE_HEIGHT = 2 * 24;
 		const THUMBNAIL_WIDTH = 72 + 8 * 2;
 		const FUDGE_HEIGHT_BEYOND_LAYER_HEIGHT = 2;
@@ -308,7 +243,7 @@
 		const boxes: { x: number; y: number; width: number; height: number }[] = [];
 
 		// Left input
-		if (nodeChainAreaLeftExtension > 0) {
+		if (hasLeftInputWire && nodeChainAreaLeftExtension > 0) {
 			boxes.push({ x: -8, y: 16, width: 16, height: 16 });
 		}
 
@@ -376,6 +311,15 @@
 		});
 		return connectedNode?.isLayer || false;
 	}
+
+	function zipWithUndefined(arr1: FrontendGraphInput[], arr2: FrontendGraphOutput[]) {
+		const maxLength = Math.max(arr1.length, arr2.length);
+		const result = [];
+		for (let i = 0; i < maxLength; i++) {
+			result.push([arr1[i], arr2[i]]);
+		}
+		return result;
+	}
 </script>
 
 <div
@@ -391,7 +335,6 @@
 	{#if $nodeGraph.contextMenuInformation}
 		<LayoutCol
 			class="context-menu"
-			classes={{ "create-node-menu": $nodeGraph.contextMenuInformation.contextMenuData === "CreateNode" }}
 			data-context-menu
 			styles={{
 				left: `${$nodeGraph.contextMenuInformation.contextMenuCoordinates.x * $nodeGraph.transform.scale + $nodeGraph.transform.x}px`,
@@ -399,21 +342,7 @@
 			}}
 		>
 			{#if $nodeGraph.contextMenuInformation.contextMenuData === "CreateNode"}
-				<TextInput placeholder="Search Nodes..." value={searchTerm} on:value={({ detail }) => (searchTerm = detail)} bind:this={nodeSearchInput} />
-				<div class="list-results" on:wheel|passive|stopPropagation>
-					{#each nodeCategories as nodeCategory}
-						<details open={nodeCategory[1].open}>
-							<summary>
-								<TextLabel>{nodeCategory[0]}</TextLabel>
-							</summary>
-							{#each nodeCategory[1].nodes as nodeType}
-								<TextButton label={nodeType.name} action={() => createNode(nodeType.name)} />
-							{/each}
-						</details>
-					{:else}
-						<TextLabel>No search results</TextLabel>
-					{/each}
-				</div>
+				<NodeCatalog on:selectNodeType={(e) => createNode(e.detail)} />
 			{:else}
 				{@const contextMenuData = $nodeGraph.contextMenuInformation.contextMenuData}
 				<LayoutRow class="toggle-layer-or-node">
@@ -438,6 +367,10 @@
 						]}
 						disabled={!canBeToggledBetweenNodeAndLayer(contextMenuData.nodeId)}
 					/>
+				</LayoutRow>
+				<Separator type="Section" direction="Vertical" />
+				<LayoutRow class="merge-selected-nodes">
+					<TextButton label="Merge Selected Nodes" action={() => editor.handle.mergeSelectedNodes()} />
 				</LayoutRow>
 			{/if}
 		</LayoutCol>
@@ -506,6 +439,19 @@
 			</svg>
 			<p class="import-text" style:--offset-left={position.x / 24} style:--offset-top={position.y / 24}>{outputMetadata.name}</p>
 		{/each}
+		{#if $nodeGraph.addImport !== undefined}
+			<div class="plus" style:--offset-left={$nodeGraph.addImport.x / 24} style:--offset-top={$nodeGraph.addImport.y / 24}>
+				<IconButton
+					class={"visibility"}
+					data-visibility-button
+					size={24}
+					icon={"Add"}
+					action={() => {
+						/* Button is purely visual, clicking is handled in NodeGraphMessage::PointerDown */
+					}}
+				/>
+			</div>
+		{/if}
 		{#each $nodeGraph.exports as { inputMetadata, position }, index}
 			<svg
 				xmlns="http://www.w3.org/2000/svg"
@@ -528,6 +474,19 @@
 			</svg>
 			<p class="export-text" style:--offset-left={position.x / 24} style:--offset-top={position.y / 24}>{inputMetadata.name}</p>
 		{/each}
+		{#if $nodeGraph.addExport !== undefined}
+			<div class="plus" style:--offset-left={$nodeGraph.addExport.x / 24} style:--offset-top={$nodeGraph.addExport.y / 24}>
+				<IconButton
+					class={"visibility"}
+					data-visibility-button
+					size={24}
+					icon={"Add"}
+					action={() => {
+						/* Button is purely visual, clicking is handled in NodeGraphMessage::PointerDown */
+					}}
+				/>
+			</div>
+		{/if}
 	</div>
 
 	<!-- Layers and nodes -->
@@ -543,6 +502,8 @@
 			{@const stackDataInput = node.exposedInputs[0]}
 			{@const layerAreaWidth = $nodeGraph.layerWidths.get(node.id) || 8}
 			{@const layerChainWidth = $nodeGraph.chainWidths.get(node.id) || 0}
+			{@const hasLeftInputWire = $nodeGraph.hasLeftInputWire.get(node.id) || false}
+			{@const description = (node.reference && $nodeGraph.nodeDescriptions.get(node.reference)) || undefined}
 			<div
 				class="layer"
 				class:selected={$nodeGraph.selected.includes(node.id)}
@@ -556,6 +517,7 @@
 				style:--data-color-dim={`var(--color-data-${(node.primaryOutput?.dataType || "General").toLowerCase()}-dim)`}
 				style:--layer-area-width={layerAreaWidth}
 				style:--node-chain-area-left-extension={layerChainWidth !== 0 ? layerChainWidth + 0.5 : 0}
+				title={`${node.displayName}\n\n${description || ""}`.trim() + (editor.handle.inDevelopmentMode() ? `\n\nNode ID: ${node.id}` : "")}
 				data-node={node.id}
 				bind:this={nodeElements[nodeIndex]}
 			>
@@ -638,9 +600,7 @@
 				{/if}
 				<div class="details">
 					<!-- TODO: Allow the user to edit the name, just like in the Layers panel -->
-					<span title={editor.handle.inDevelopmentMode() ? `Node ID: ${node.id}` : undefined}>
-						{node.displayName}
-					</span>
+					<span>{node.displayName}</span>
 				</div>
 				<div class="solo-drag-grip" title="Drag only this layer without pushing others outside the stack"></div>
 				<IconButton
@@ -658,7 +618,7 @@
 					<defs>
 						<clipPath id={clipPathId}>
 							<!-- Keep this equation in sync with the equivalent one in the CSS rule for `.layer { width: ... }` below -->
-							<path clip-rule="evenodd" d={layerBorderMask(24 * layerAreaWidth - 12, layerChainWidth ? (0.5 + layerChainWidth) * 24 : 0)} />
+							<path clip-rule="evenodd" d={layerBorderMask(24 * layerAreaWidth - 12, layerChainWidth ? (0.5 + layerChainWidth) * 24 : 0, hasLeftInputWire)} />
 						</clipPath>
 					</defs>
 				</svg>
@@ -684,8 +644,9 @@
 
 		<!-- Nodes -->
 		{#each Array.from($nodeGraph.nodes.values()).flatMap((node, nodeIndex) => (node.isLayer ? [] : [{ node, nodeIndex }])) as { node, nodeIndex } (nodeIndex)}
-			{@const exposedInputsOutputs = [...node.exposedInputs, ...node.exposedOutputs]}
+			{@const exposedInputsOutputs = zipWithUndefined(node.exposedInputs, node.exposedOutputs)}
 			{@const clipPathId = String(Math.random()).substring(2)}
+			{@const description = (node.reference && $nodeGraph.nodeDescriptions.get(node.reference)) || undefined}
 			<div
 				class="node"
 				class:selected={$nodeGraph.selected.includes(node.id)}
@@ -696,6 +657,7 @@
 				style:--clip-path-id={`url(#${clipPathId})`}
 				style:--data-color={`var(--color-data-${(node.primaryOutput?.dataType || "General").toLowerCase()})`}
 				style:--data-color-dim={`var(--color-data-${(node.primaryOutput?.dataType || "General").toLowerCase()}-dim)`}
+				title={`${node.displayName}\n\n${description || ""}`.trim() + (editor.handle.inDevelopmentMode() ? `\n\nNode ID: ${node.id}` : "")}
 				data-node={node.id}
 				bind:this={nodeElements[nodeIndex]}
 			>
@@ -707,14 +669,16 @@
 				<div class="primary" class:in-selected-network={$nodeGraph.inSelectedNetwork} class:no-secondary-section={exposedInputsOutputs.length === 0}>
 					<IconLabel icon={nodeIcon(node.reference)} />
 					<!-- TODO: Allow the user to edit the name, just like in the Layers panel -->
-					<TextLabel tooltip={editor.handle.inDevelopmentMode() ? `Node ID: ${node.id}` : undefined}>{node.displayName}</TextLabel>
+					<TextLabel>{node.displayName}</TextLabel>
 				</div>
 				<!-- Secondary rows -->
 				{#if exposedInputsOutputs.length > 0}
 					<div class="secondary" class:in-selected-network={$nodeGraph.inSelectedNetwork}>
-						{#each exposedInputsOutputs as secondary, index}
-							<div class={`secondary-row expanded ${index < node.exposedInputs.length ? "input" : "output"}`}>
-								<TextLabel tooltip={secondary.name}>{secondary.name}</TextLabel>
+						{#each exposedInputsOutputs as [input, output]}
+							<div class={`secondary-row expanded ${input !== undefined ? "input" : "output"}`}>
+								<TextLabel tooltip={input !== undefined ? input.name : output.name}>
+									{input !== undefined ? input.name : output.name}
+								</TextLabel>
 							</div>
 						{/each}
 					</div>
@@ -871,67 +835,13 @@
 			background-color: var(--color-3-darkgray);
 			border-radius: 4px;
 
-			&.create-node-menu {
-				height: 200px; // For some reason, when attemping to make this taller, the bottom few categories don't open when clicked, but instead immediately close the menu
-				width: 180px; // Also when making this wider, clicking the scrollbar on the right edge of the menu causes the menu to close immediately
-			}
-
-			.text-input {
-				flex: 0 0 auto;
-				margin-bottom: 4px;
-			}
-
-			.list-results {
-				overflow-y: auto;
-				flex: 1 1 auto;
-				// Together with the `margin-right: 4px;` on `details` below, this keeps a gap between the listings and the scrollbar
-				margin-right: -4px;
-
-				details {
-					cursor: pointer;
-					display: flex;
-					flex-direction: column;
-					// Together with the `margin-right: -4px;` on `.list-results` above, this keeps a gap between the listings and the scrollbar
-					margin-right: 4px;
-
-					&[open] summary .text-label::before {
-						transform: rotate(90deg);
-					}
-
-					summary {
-						display: flex;
-						align-items: center;
-						gap: 2px;
-
-						.text-label {
-							padding-left: 16px;
-							position: relative;
-							width: 100%;
-
-							&::before {
-								content: "";
-								position: absolute;
-								margin: auto;
-								top: 0;
-								bottom: 0;
-								left: 0;
-								width: 8px;
-								height: 8px;
-								background: var(--icon-expand-collapse-arrow);
-							}
-						}
-					}
-
-					.text-button {
-						width: 100%;
-						margin: 4px 0;
-					}
-				}
-			}
-
 			.toggle-layer-or-node .text-label {
 				line-height: 24px;
 				margin-right: 8px;
+			}
+
+			.merge-selected-nodes {
+				justify-content: center;
 			}
 		}
 
@@ -1002,6 +912,14 @@
 				height: 8px;
 				margin-top: 4px;
 				margin-left: 5px;
+				top: calc(var(--offset-top) * 24px);
+				left: calc(var(--offset-left) * 24px);
+			}
+
+			.plus {
+				margin-top: -4px;
+				margin-left: -4px;
+				position: absolute;
 				top: calc(var(--offset-top) * 24px);
 				left: calc(var(--offset-left) * 24px);
 			}
@@ -1126,7 +1044,7 @@
 			}
 
 			&.disabled {
-				background: var(--color-3-darkgray);
+				background: rgba(var(--color-4-dimgray-rgb), 0.33);
 				color: var(--color-a-softgray);
 
 				.icon-label {
@@ -1178,10 +1096,10 @@
 			}
 
 			&.selected {
-				background: rgba(var(--color-5-dullgray-rgb), 0.5);
+				background: rgba(var(--color-5-dullgray-rgb), 0.33);
 
 				&.in-selected-network {
-					background: rgba(var(--color-6-lowergray-rgb), 0.5);
+					background: rgba(var(--color-6-lowergray-rgb), 0.33);
 				}
 			}
 

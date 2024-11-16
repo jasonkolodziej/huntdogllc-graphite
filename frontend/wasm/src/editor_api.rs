@@ -7,7 +7,6 @@
 use crate::helpers::translate_key;
 use crate::{Error, EDITOR, EDITOR_HANDLE, EDITOR_HAS_CRASHED};
 
-use editor::application::generate_uuid;
 use editor::application::Editor;
 use editor::consts::FILE_SAVE_SUFFIX;
 use editor::messages::input_mapper::utility_types::input_keyboard::ModifierKeys;
@@ -443,13 +442,12 @@ impl EditorHandle {
 
 	/// A font has been downloaded
 	#[wasm_bindgen(js_name = onFontLoad)]
-	pub fn on_font_load(&self, font_family: String, font_style: String, preview_url: String, data: Vec<u8>, is_default: bool) -> Result<(), JsValue> {
+	pub fn on_font_load(&self, font_family: String, font_style: String, preview_url: String, data: Vec<u8>) -> Result<(), JsValue> {
 		let message = PortfolioMessage::FontLoaded {
 			font_family,
 			font_style,
 			preview_url,
 			data,
-			is_default,
 		};
 		self.dispatch(message);
 
@@ -571,15 +569,21 @@ impl EditorHandle {
 		self.dispatch(message);
 	}
 
+	/// Merge a group of nodes into a subnetwork
+	#[wasm_bindgen(js_name = mergeSelectedNodes)]
+	pub fn merge_nodes(&self) {
+		let message = NodeGraphMessage::MergeSelectedNodes;
+		self.dispatch(message);
+	}
+
 	/// Creates a new document node in the node graph
 	#[wasm_bindgen(js_name = createNode)]
 	pub fn create_node(&self, node_type: String, x: i32, y: i32) {
-		let id = NodeId(generate_uuid());
+		let id = NodeId::new();
 		let message = NodeGraphMessage::CreateNodeFromContextMenu {
 			node_id: Some(id),
 			node_type,
-			x: x / 24,
-			y: y / 24,
+			xy: Some((x / 24, y / 24)),
 		};
 		self.dispatch(message);
 	}
@@ -653,20 +657,16 @@ impl EditorHandle {
 		self.dispatch(message);
 	}
 
+	/// Pin or unpin a node given its node ID
+	#[wasm_bindgen(js_name = setNodePinned)]
+	pub fn set_node_pinned(&self, id: u64, pinned: bool) {
+		self.dispatch(DocumentMessage::SetNodePinned { node_id: NodeId(id), pinned });
+	}
+
 	/// Delete a layer or node given its node ID
 	#[wasm_bindgen(js_name = deleteNode)]
 	pub fn delete_node(&self, id: u64) {
-		let message = DocumentMessage::StartTransaction;
-		self.dispatch(message);
-
-		let id = NodeId(id);
-		self.dispatch(NodeGraphMessage::DeleteNodes {
-			node_ids: vec![id],
-			delete_children: true,
-		});
-		self.dispatch(NodeGraphMessage::RunDocumentGraph);
-		self.dispatch(NodeGraphMessage::SelectedNodesUpdated);
-		self.dispatch(NodeGraphMessage::SendGraph);
+		self.dispatch(DocumentMessage::DeleteNode { node_id: NodeId(id) });
 	}
 
 	/// Toggle lock state of a layer from the layer list
@@ -694,11 +694,7 @@ impl EditorHandle {
 	/// Toggle display type for a layer
 	#[wasm_bindgen(js_name = setToNodeOrLayer)]
 	pub fn set_to_node_or_layer(&self, id: u64, is_layer: bool) {
-		let node_id = NodeId(id);
-		let message = DocumentMessage::StartTransaction;
-		self.dispatch(message);
-		let message = NodeGraphMessage::SetToNodeOrLayer { node_id, is_layer };
-		self.dispatch(message);
+		self.dispatch(DocumentMessage::SetToNodeOrLayer { node_id: NodeId(id), is_layer });
 	}
 
 	#[wasm_bindgen(js_name = injectImaginatePollServerStatus)]
@@ -774,9 +770,7 @@ impl EditorHandle {
 					document
 						.network_interface
 						.replace_implementation(&node_id, &[], DocumentNodeImplementation::proto("graphene_core::ToArtboardNode"));
-					document
-						.network_interface
-						.add_input(&node_id, &[], TaggedValue::IVec2(glam::IVec2::default()), false, 2, "".to_string());
+					document.network_interface.add_import(TaggedValue::IVec2(glam::IVec2::default()), false, 2, "".to_string(), &[node_id]);
 				}
 			}
 		}

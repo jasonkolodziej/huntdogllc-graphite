@@ -4,16 +4,18 @@ use crate::messages::portfolio::document::utility_types::document_metadata::{Doc
 use crate::messages::portfolio::document::utility_types::misc::{GeometrySnapSource, SnapSource};
 use crate::messages::portfolio::document::utility_types::network_interface::NodeNetworkInterface;
 use crate::messages::prelude::*;
+use crate::messages::tool::tool_messages::path_tool::PointSelectState;
 
 use bezier_rs::{Bezier, BezierHandles, TValue};
 use graphene_core::transform::Transform;
 use graphene_core::vector::{ManipulatorPointId, PointId, VectorData, VectorModificationType};
 
-use glam::DVec2;
+use glam::{DAffine2, DVec2};
 use graphene_std::vector::{HandleId, SegmentId};
 
-#[derive(Debug, PartialEq, Copy, Clone)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone, Default)]
 pub enum ManipulatorAngle {
+	#[default]
 	Colinear,
 	Free,
 	Mixed,
@@ -161,9 +163,9 @@ impl ClosestSegment {
 		midpoint
 	}
 
-	pub fn adjusted_insert_and_select(&self, shape_editor: &mut ShapeState, responses: &mut VecDeque<Message>, add_to_selection: bool) {
+	pub fn adjusted_insert_and_select(&self, shape_editor: &mut ShapeState, responses: &mut VecDeque<Message>, extend_selection: bool) {
 		let id = self.adjusted_insert(responses);
-		shape_editor.select_anchor_point_by_id(self.layer, id, add_to_selection)
+		shape_editor.select_anchor_point_by_id(self.layer, id, extend_selection)
 	}
 }
 
@@ -221,7 +223,7 @@ impl ShapeState {
 
 	/// Select/deselect the first point within the selection threshold.
 	/// Returns a tuple of the points if found and the offset, or `None` otherwise.
-	pub fn change_point_selection(&mut self, network_interface: &NodeNetworkInterface, mouse_position: DVec2, select_threshold: f64, add_to_selection: bool) -> Option<Option<SelectedPointsInfo>> {
+	pub fn change_point_selection(&mut self, network_interface: &NodeNetworkInterface, mouse_position: DVec2, select_threshold: f64, extend_selection: bool) -> Option<Option<SelectedPointsInfo>> {
 		if self.selected_shape_state.is_empty() {
 			return None;
 		}
@@ -234,14 +236,14 @@ impl ShapeState {
 			let already_selected = selected_shape_state.is_selected(manipulator_point_id);
 
 			// Should we select or deselect the point?
-			let new_selected = if already_selected { !add_to_selection } else { true };
+			let new_selected = if already_selected { !extend_selection } else { true };
 
 			// Offset to snap the selected point to the cursor
 			let offset = mouse_position - network_interface.document_metadata().transform_to_viewport(layer).transform_point2(point_position);
 
 			// This is selecting the manipulator only for now, next to generalize to points
 			if new_selected {
-				let retain_existing_selection = add_to_selection || already_selected;
+				let retain_existing_selection = extend_selection || already_selected;
 				if !retain_existing_selection {
 					self.deselect_all_points();
 				}
@@ -267,8 +269,8 @@ impl ShapeState {
 		None
 	}
 
-	pub fn select_anchor_point_by_id(&mut self, layer: LayerNodeIdentifier, id: PointId, add_to_selection: bool) {
-		if !add_to_selection {
+	pub fn select_anchor_point_by_id(&mut self, layer: LayerNodeIdentifier, id: PointId, extend_selection: bool) {
+		if !extend_selection {
 			self.deselect_all_points();
 		}
 		let point = ManipulatorPointId::Anchor(id);
@@ -610,15 +612,28 @@ impl ShapeState {
 	}
 
 	/// Move the selected points by dragging the mouse.
-	pub fn move_selected_points(&self, handle_lengths: Option<OpposingHandleLengths>, document: &DocumentMessageHandler, delta: DVec2, equidistant: bool, responses: &mut VecDeque<Message>) {
+	pub fn move_selected_points(
+		&self,
+		handle_lengths: Option<OpposingHandleLengths>,
+		document: &DocumentMessageHandler,
+		delta: DVec2,
+		equidistant: bool,
+		responses: &mut VecDeque<Message>,
+		in_viewport_space: bool,
+	) {
 		for (&layer, state) in &self.selected_shape_state {
-			let Some(vector_data) = document.network_interface.compute_modified_vector(layer) else {
-				continue;
-			};
+			let Some(vector_data) = document.network_interface.compute_modified_vector(layer) else { continue };
+
 			let opposing_handles = handle_lengths.as_ref().and_then(|handle_lengths| handle_lengths.get(&layer));
 
-			let transform = document.metadata().transform_to_viewport(layer);
-			let delta = transform.inverse().transform_vector2(delta);
+			let transform_to_viewport_space = document.metadata().transform_to_viewport(layer);
+			let transform_to_document_space = document.metadata().transform_to_document(layer);
+			let delta_transform = if in_viewport_space {
+				transform_to_viewport_space
+			} else {
+				DAffine2::from_angle(document.document_ptz.tilt()) * transform_to_document_space
+			};
+			let delta = delta_transform.inverse().transform_vector2(delta);
 
 			for &point in state.selected_points.iter() {
 				let handle = match point {
@@ -652,7 +667,8 @@ impl ShapeState {
 				let new_relative = if equidistant {
 					-(handle_position - anchor_position)
 				} else {
-					let transform = document.metadata().document_to_viewport.inverse() * transform;
+					// TODO: Is this equivalent to `transform_to_document_space`? If changed, the before and after should be tested.
+					let transform = document.metadata().document_to_viewport.inverse() * transform_to_viewport_space;
 					let Some(other_position) = other.to_manipulator_point().get_position(&vector_data) else {
 						continue;
 					};
@@ -1060,7 +1076,114 @@ impl ShapeState {
 			_ => self.sorted_selected_layers(network_interface.document_metadata()).find_map(closest_seg),
 		}
 	}
+	pub fn get_dragging_state(&self, network_interface: &NodeNetworkInterface) -> PointSelectState {
+		for &layer in self.selected_shape_state.keys() {
+			let Some(vector_data) = network_interface.compute_modified_vector(layer) else { continue };
 
+			for point in self.selected_points() {
+				if point.as_anchor().is_some() {
+					return PointSelectState::Anchor;
+				}
+				if point.get_handle_pair(&vector_data).is_some() {
+					return PointSelectState::HandleWithPair;
+				}
+			}
+		}
+		PointSelectState::HandleNoPair
+	}
+
+	/// Returns true if at least one handle with pair is selected
+	pub fn handle_with_pair_selected(&mut self, network_interface: &NodeNetworkInterface) -> bool {
+		for &layer in self.selected_shape_state.keys() {
+			let Some(vector_data) = network_interface.compute_modified_vector(layer) else { continue };
+
+			for point in self.selected_points() {
+				if point.as_anchor().is_some() {
+					return false;
+				}
+				if point.get_handle_pair(&vector_data).is_some() {
+					return true;
+				}
+			}
+		}
+
+		false
+	}
+
+	/// Alternate selected handles to mirrors
+	pub fn alternate_selected_handles(&mut self, network_interface: &NodeNetworkInterface) {
+		let mut handles_to_update = Vec::new();
+
+		for &layer in self.selected_shape_state.keys() {
+			let Some(vector_data) = network_interface.compute_modified_vector(layer) else { continue };
+
+			for point in self.selected_points() {
+				if point.as_anchor().is_some() {
+					continue;
+				}
+				if let Some(handles) = point.get_handle_pair(&vector_data) {
+					// handle[0] is selected, handle[1] is opposite / mirror handle
+					handles_to_update.push((layer, handles[0].to_manipulator_point(), handles[1].to_manipulator_point()));
+				}
+			}
+		}
+
+		for (layer, handle_to_deselect, handle_to_select) in handles_to_update {
+			if let Some(state) = self.selected_shape_state.get_mut(&layer) {
+				let points = &state.selected_points;
+				let both_selected = points.contains(&handle_to_deselect) && points.contains(&handle_to_select);
+				if both_selected {
+					continue;
+				}
+
+				state.deselect_point(handle_to_deselect);
+				state.select_point(handle_to_select);
+			}
+		}
+	}
+
+	/// Selects handles and anchor connected to current handle
+	pub fn select_handles_and_anchor_connected_to_current_handle(&mut self, network_interface: &NodeNetworkInterface) {
+		let mut points_to_select: Vec<(LayerNodeIdentifier, Option<PointId>, Option<ManipulatorPointId>)> = Vec::new();
+
+		for &layer in self.selected_shape_state.keys() {
+			let Some(vector_data) = network_interface.compute_modified_vector(layer) else {
+				continue;
+			};
+
+			for point in self.selected_points().filter(|point| point.as_handle().is_some()) {
+				let anchor = point.get_anchor(&vector_data);
+				if let Some(handles) = point.get_handle_pair(&vector_data) {
+					points_to_select.push((layer, anchor, Some(handles[1].to_manipulator_point())));
+				} else {
+					points_to_select.push((layer, anchor, None));
+				}
+			}
+		}
+
+		for (layer, anchor, handle) in points_to_select {
+			if let Some(state) = self.selected_shape_state.get_mut(&layer) {
+				if let Some(anchor) = anchor {
+					state.select_point(ManipulatorPointId::Anchor(anchor));
+				}
+				if let Some(handle) = handle {
+					state.select_point(handle);
+				}
+			}
+		}
+	}
+
+	pub fn select_points_by_manipulator_id(&mut self, points: &Vec<ManipulatorPointId>) {
+		let layers_to_modify: Vec<_> = self.selected_shape_state.keys().cloned().collect();
+
+		for layer in layers_to_modify {
+			if let Some(state) = self.selected_shape_state.get_mut(&layer) {
+				for point in points {
+					state.select_point(*point);
+				}
+			}
+		}
+	}
 	/// Converts a nearby clicked anchor point's handles between sharp (zero-length handles) and smooth (pulled-apart handle(s)).
 	/// If both handles aren't zero-length, they are set that. If both are zero-length, they are stretched apart by a reasonable amount.
 	/// This can can be activated by double clicking on an anchor with the Path tool.

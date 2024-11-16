@@ -4,6 +4,7 @@ use crate::messages::portfolio::document::utility_types::document_metadata::Laye
 use crate::messages::portfolio::document::utility_types::network_interface::{InputConnector, NodeTemplate, OutputConnector};
 use crate::messages::prelude::*;
 
+use glam::IVec2;
 use graph_craft::document::value::TaggedValue;
 use graph_craft::document::{NodeId, NodeInput};
 use graph_craft::proto::GraphErrors;
@@ -16,17 +17,30 @@ pub enum NodeGraphMessage {
 		nodes: Vec<(NodeId, NodeTemplate)>,
 		new_ids: HashMap<NodeId, NodeId>,
 	},
+	AddImport,
+	AddExport,
 	Init,
 	SelectedNodesUpdated,
 	Copy,
+	CreateNodeInLayerNoTransaction {
+		node_type: String,
+		layer: LayerNodeIdentifier,
+	},
+	CreateNodeInLayerWithTransaction {
+		node_type: String,
+		layer: LayerNodeIdentifier,
+	},
 	CreateNodeFromContextMenu {
 		node_id: Option<NodeId>,
 		node_type: String,
-		x: i32,
-		y: i32,
+		xy: Option<(i32, i32)>,
 	},
 	CreateWire {
 		output_connector: OutputConnector,
+		input_connector: InputConnector,
+	},
+	ConnectUpstreamOutputToInput {
+		downstream_input: InputConnector,
 		input_connector: InputConnector,
 	},
 	Cut,
@@ -57,10 +71,15 @@ pub enum NodeGraphMessage {
 		input_connector: InputConnector,
 		insert_node_input_index: usize,
 	},
+	MergeSelectedNodes,
 	MoveLayerToStack {
 		layer: LayerNodeIdentifier,
 		parent: LayerNodeIdentifier,
 		insert_index: usize,
+	},
+	MoveNodeToChainStart {
+		node_id: NodeId,
+		parent: LayerNodeIdentifier,
 	},
 	PasteNodes {
 		serialized_nodes: String,
@@ -111,17 +130,21 @@ pub enum NodeGraphMessage {
 		node_id: NodeId,
 		alias: String,
 	},
+	SetToNodeOrLayer {
+		node_id: NodeId,
+		is_layer: bool,
+	},
 	ShiftNodePosition {
 		node_id: NodeId,
 		x: i32,
 		y: i32,
 	},
-	SetToNodeOrLayer {
-		node_id: NodeId,
-		is_layer: bool,
-	},
 	ShiftSelectedNodes {
 		direction: Direction,
+		rubber_band: bool,
+	},
+	ShiftSelectedNodesByAmount {
+		graph_delta: IVec2,
 		rubber_band: bool,
 	},
 	TogglePreview {
@@ -166,6 +189,7 @@ pub enum NodeGraphMessage {
 		node_graph_errors: GraphErrors,
 	},
 	UpdateActionButtons,
+	UpdateGraphBarRight,
 	UpdateInSelectedNetwork,
 	SendSelectedNodes,
 }

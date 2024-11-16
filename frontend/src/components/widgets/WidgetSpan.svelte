@@ -6,6 +6,7 @@
 	import type { Widget, WidgetSpanColumn, WidgetSpanRow } from "@graphite/wasm-communication/messages";
 	import { narrowWidgetProps, isWidgetSpanColumn, isWidgetSpanRow } from "@graphite/wasm-communication/messages";
 
+	import NodeCatalog from "@graphite/components/floating-menus/NodeCatalog.svelte";
 	import BreadcrumbTrailButtons from "@graphite/components/widgets/buttons/BreadcrumbTrailButtons.svelte";
 	import ColorButton from "@graphite/components/widgets/buttons/ColorButton.svelte";
 	import IconButton from "@graphite/components/widgets/buttons/IconButton.svelte";
@@ -127,6 +128,10 @@
 		{#if imageLabel}
 			<ImageLabel {...exclude(imageLabel)} />
 		{/if}
+		{@const nodeCatalog = narrowWidgetProps(component.props, "NodeCatalog")}
+		{#if nodeCatalog}
+			<NodeCatalog {...exclude(nodeCatalog)} on:selectNodeType={(e) => widgetValueCommitAndUpdate(index, e.detail)} />
+		{/if}
 		{@const numberInput = narrowWidgetProps(component.props, "NumberInput")}
 		{#if numberInput}
 			<NumberInput
@@ -169,7 +174,7 @@
 		{/if}
 		{@const breadcrumbTrailButtons = narrowWidgetProps(component.props, "BreadcrumbTrailButtons")}
 		{#if breadcrumbTrailButtons}
-			<BreadcrumbTrailButtons {...exclude(breadcrumbTrailButtons)} action={(index) => widgetValueCommitAndUpdate(index, index)} />
+			<BreadcrumbTrailButtons {...exclude(breadcrumbTrailButtons)} action={(breadcrumbIndex) => widgetValueCommitAndUpdate(index, breadcrumbIndex)} />
 		{/if}
 		{@const textInput = narrowWidgetProps(component.props, "TextInput")}
 		{#if textInput}

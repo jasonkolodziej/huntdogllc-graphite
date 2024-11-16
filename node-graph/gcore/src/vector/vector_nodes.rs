@@ -1,10 +1,11 @@
 use super::misc::CentroidType;
 use super::style::{Fill, Gradient, GradientStops, Stroke};
-use super::{PointId, SegmentId, StrokeId, VectorData};
+use super::{PointId, SegmentDomain, SegmentId, StrokeId, VectorData};
 use crate::registry::types::{Angle, Fraction, IntegerCount, Length, SeedValue};
 use crate::renderer::GraphicElementRendered;
 use crate::transform::{Footprint, Transform, TransformMut};
 use crate::vector::style::LineJoin;
+use crate::vector::PointDomain;
 use crate::{Color, GraphicElement, GraphicGroup};
 
 use bezier_rs::{Cap, Join, Subpath, SubpathTValue, TValue};
@@ -161,7 +162,7 @@ async fn fill<F: 'n + Send, FillTy: Into<Fill> + 'n + Send, TargetTy: VectorIter
 }
 
 #[node_macro::node(category("Vector: Style"), path(graphene_core::vector))]
-async fn stroke<F: 'n + Send, ColourTy: Into<Option<Color>> + 'n + Send, TargetTy: VectorIterMut + 'n + Send>(
+async fn stroke<F: 'n + Send, ColorTy: Into<Option<Color>> + 'n + Send, TargetTy: VectorIterMut + 'n + Send>(
 	#[implementations(
 		(),
 		(),
@@ -195,7 +196,7 @@ async fn stroke<F: 'n + Send, ColourTy: Into<Option<Color>> + 'n + Send, TargetT
 		Color,
 	)]
 	#[default(Color::BLACK)]
-	color: ColourTy,
+	color: ColorTy,
 	#[default(2.)] weight: f64,
 	dash_lengths: Vec<f64>,
 	dash_offset: f64,
@@ -292,7 +293,7 @@ async fn circular_repeat<F: 'n + Send + Copy, I: 'n + GraphicElementRendered + T
 	)]
 	instance: impl Node<F, Output = I>,
 	angle_offset: Angle,
-	#[default(5)] radius: Length,
+	#[default(5)] radius: f64,
 	#[default(5)] instances: IntegerCount,
 ) -> GraphicGroup {
 	let instance = instance.eval(footprint).await;
@@ -546,12 +547,14 @@ async fn flatten_vector_elements<F: 'n + Send>(
 	graphic_group_input: impl Node<F, Output = GraphicGroup>,
 ) -> VectorData {
 	let graphic_group = graphic_group_input.eval(footprint).await;
-
+	// A node based solution to support passing through vector data could be a network node with a cache node connected to
+	// a flatten vector elements connected to an if else node, another connection from the cache directly
+	// To the if else node, and another connection from the cache to a matches type node connected to the if else node.
 	fn concat_group(graphic_group: &GraphicGroup, current_transform: DAffine2, result: &mut VectorData) {
-		for (element, _) in graphic_group.iter() {
+		for (element, reference) in graphic_group.iter() {
 			match element {
 				GraphicElement::VectorData(vector_data) => {
-					result.concat(vector_data, current_transform);
+					result.concat(vector_data, current_transform, reference.map(|node_id| node_id.0).unwrap_or_default());
 				}
 				GraphicElement::GraphicGroup(graphic_group) => {
 					concat_group(graphic_group, current_transform * graphic_group.transform, result);
@@ -565,15 +568,16 @@ async fn flatten_vector_elements<F: 'n + Send>(
 	concat_group(&graphic_group, DAffine2::IDENTITY, &mut result);
 	// TODO: This leads to incorrect stroke widths when flattening groups with different transforms.
 	result.style.set_stroke_transform(DAffine2::IDENTITY);
+
 	result
 }
 
 pub trait ConcatElement {
-	fn concat(&mut self, other: &Self, transform: DAffine2);
+	fn concat(&mut self, other: &Self, transform: DAffine2, node_id: u64);
 }
 
 impl ConcatElement for GraphicGroup {
-	fn concat(&mut self, other: &Self, transform: DAffine2) {
+	fn concat(&mut self, other: &Self, transform: DAffine2, _node_id: u64) {
 		// TODO: Decide if we want to keep this behavior whereby the layers are flattened
 		for (mut element, footprint_mapping) in other.iter().cloned() {
 			*element.transform_mut() = transform * element.transform() * other.transform();
@@ -605,67 +609,149 @@ async fn sample_points<F: 'n + Send + Copy>(
 	)]
 	subpath_segment_lengths: impl Node<F, Output = Vec<f64>>,
 ) -> VectorData {
+	// Evaluate vector data and subpath segment lengths asynchronously.
 	let vector_data = vector_data.eval(footprint).await;
 	let subpath_segment_lengths = subpath_segment_lengths.eval(footprint).await;
 
+	// Create an iterator over the bezier segments with enumeration and peeking capability.
 	let mut bezier = vector_data.segment_bezier_iter().enumerate().peekable();
 
+	// Initialize the result VectorData with the same transformation as the input.
 	let mut result = VectorData::empty();
 	result.transform = vector_data.transform;
 
-	while let Some((index, (segment, _, _, mut last_end))) = bezier.next() {
-		let mut lengths = vec![(segment, subpath_segment_lengths.get(index).copied().unwrap_or_default())];
+	// Iterate over each segment in the bezier iterator.
+	while let Some((index, (segment_id, _, start_point_index, mut last_end))) = bezier.next() {
+		// Record the start point index of the subpath.
+		let subpath_start_point_index = start_point_index;
 
-		while let Some((index, (segment, _, _, end))) = bezier.peek().is_some_and(|(_, (_, _, start, _))| *start == last_end).then(|| bezier.next()).flatten() {
-			last_end = end;
-			lengths.push((segment, subpath_segment_lengths.get(index).copied().unwrap_or_default()));
+		// Collect connected segments that form a continuous path.
+		let mut lengths = vec![(segment_id, subpath_segment_lengths.get(index).copied().unwrap_or_default())];
+
+		// Continue collecting segments as long as they are connected end-to-start.
+		while let Some(&seg) = bezier.peek() {
+			let (_, (_, _, ref start, _)) = seg;
+			if *start == last_end {
+				// Consume the next element since it continues the path.
+				let (index, (next_segment_id, _, _, end)) = bezier.next().unwrap();
+				last_end = end;
+				lengths.push((next_segment_id, subpath_segment_lengths.get(index).copied().unwrap_or_default()));
+			} else {
+				// The next segment does not continue the path.
+				break;
+			}
 		}
 
+		// Determine if the subpath is closed.
+		let subpath_is_closed = last_end == subpath_start_point_index;
+
+		// Calculate the total length of the collected segments.
 		let total_length: f64 = lengths.iter().map(|(_, len)| *len).sum();
 
+		// Adjust the usable length by subtracting start and stop offsets.
 		let mut used_length = total_length - start_offset - stop_offset;
 		if used_length <= 0. {
 			continue;
 		}
 
-		let count;
-		if adaptive_spacing {
+		// Determine the number of points to generate along the path.
+		let count = if adaptive_spacing {
+			// Calculate point count to evenly distribute points while covering the entire path.
 			// With adaptive spacing, we widen or narrow the points as necessary to ensure the last point is always at the end of the path.
-			count = (used_length / spacing).round();
+			(used_length / spacing).round()
 		} else {
-			// Without adaptive spacing, we just evenly space the points at the exact specified spacing, usually falling short before the end of the path.
-			count = (used_length / spacing + f64::EPSILON).floor();
-			used_length = used_length - used_length % spacing;
-		}
+			// Calculate point count based on exact spacing, which may not cover the entire path.
 
+			// Without adaptive spacing, we just evenly space the points at the exact specified spacing, usually falling short before the end of the path.
+			let c = (used_length / spacing + f64::EPSILON).floor();
+			used_length -= used_length % spacing;
+			c
+		};
+
+		// Skip if there are no points to generate.
 		if count < 1. {
 			continue;
 		}
-		for c in 0..=count as usize {
+
+		// Initialize a vector to store indices of generated points.
+		let mut point_indices = Vec::new();
+
+		// Generate points along the path based on calculated intervals.
+		let max_c = if subpath_is_closed { count as usize - 1 } else { count as usize };
+		for c in 0..=max_c {
 			let fraction = c as f64 / count;
 			let total_distance = fraction * used_length + start_offset;
 
-			let (mut segment, mut length) = lengths[0];
+			// Find the segment corresponding to the current total_distance.
+			let (mut current_segment_id, mut length) = lengths[0];
 			let mut total_length_before = 0.;
-			for &(next_segment, next_length) in lengths.iter().skip(1) {
+			for &(next_segment_id, next_length) in lengths.iter().skip(1) {
 				if total_length_before + length > total_distance {
 					break;
 				}
 
 				total_length_before += length;
-				segment = next_segment;
+				current_segment_id = next_segment_id;
 				length = next_length;
 			}
 
-			let Some(segment) = vector_data.segment_from_id(segment) else { continue };
+			// Retrieve the segment and apply transformation.
+			let Some(segment) = vector_data.segment_from_id(current_segment_id) else { continue };
 			let segment = segment.apply_transformation(|point| vector_data.transform.transform_point2(point));
 
+			// Calculate the position on the segment.
 			let parametric_t = segment.euclidean_to_parametric_with_total_length((total_distance - total_length_before) / length, 0.001, length);
 			let point = segment.evaluate(TValue::Parametric(parametric_t));
-			result.point_domain.push(PointId::generate(), vector_data.transform.inverse().transform_point2(point));
+
+			// Generate a new PointId and add the point to result.point_domain.
+			let point_id = PointId::generate();
+			result.point_domain.push(point_id, vector_data.transform.inverse().transform_point2(point));
+
+			// Store the index of the point.
+			let point_index = result.point_domain.ids().len() - 1;
+			point_indices.push(point_index);
+		}
+
+		// After generating points, create segments between consecutive points.
+		for window in point_indices.windows(2) {
+			if let [start_index, end_index] = *window {
+				// Generate a new SegmentId.
+				let segment_id = SegmentId::generate();
+
+				// Use BezierHandles::Linear for linear segments.
+				let handles = bezier_rs::BezierHandles::Linear;
+
+				// Generate a new StrokeId.
+				let stroke_id = StrokeId::generate();
+
+				// Add the segment to result.segment_domain.
+				result.segment_domain.push(segment_id, start_index, end_index, handles, stroke_id);
+			}
+		}
+
+		// If the subpath is closed, add a closing segment connecting the last point to the first point.
+		if subpath_is_closed {
+			if let (Some(&first_index), Some(&last_index)) = (point_indices.first(), point_indices.last()) {
+				// Generate a new SegmentId.
+				let segment_id = SegmentId::generate();
+
+				// Use BezierHandles::Linear for linear segments.
+				let handles = bezier_rs::BezierHandles::Linear;
+
+				// Generate a new StrokeId.
+				let stroke_id = StrokeId::generate();
+
+				// Add the closing segment to result.segment_domain.
+				result.segment_domain.push(segment_id, last_index, first_index, handles, stroke_id);
+			}
 		}
 	}
 
+	// Transfer the style from the input vector data to the result.
+	result.style = vector_data.style.clone();
+	result.style.set_stroke_transform(vector_data.transform);
+
+	// Return the resulting vector data with newly generated points and segments.
 	result
 }
 
@@ -702,10 +788,28 @@ async fn poisson_disk_points<F: 'n + Send>(
 
 		subpath.apply_transform(vector_data.transform);
 
+		let mut previous_point_index: Option<usize> = None;
+
 		for point in subpath.poisson_disk_points(separation_disk_diameter, || rng.gen::<f64>()) {
-			result.point_domain.push(PointId::generate(), point);
+			let point_id = PointId::generate();
+			result.point_domain.push(point_id, point);
+
+			// Get the index of the newly added point.
+			let point_index = result.point_domain.ids().len() - 1;
+
+			// If there is a previous point, connect it with the current point by adding a segment.
+			if let Some(prev_point_index) = previous_point_index {
+				let segment_id = SegmentId::generate();
+				result.segment_domain.push(segment_id, prev_point_index, point_index, bezier_rs::BezierHandles::Linear, StrokeId::ZERO);
+			}
+
+			previous_point_index = Some(point_index);
 		}
 	}
+
+	// Transfer the style from the input vector data to the result.
+	result.style = vector_data.style.clone();
+	result.style.set_stroke_transform(DAffine2::IDENTITY);
 
 	result
 }
@@ -732,26 +836,117 @@ async fn subpath_segment_lengths<F: 'n + Send>(
 }
 
 #[node_macro::node(name("Splines from Points"), category("Vector"), path(graphene_core::vector))]
-fn splines_from_points(_: (), mut vector_data: VectorData) -> VectorData {
-	let points = &vector_data.point_domain;
+async fn splines_from_points<F: 'n + Send>(
+	#[implementations(
+		(),
+		Footprint,
+	)]
+	footprint: F,
+	#[implementations(
+		() -> VectorData,
+		Footprint -> VectorData,
+	)]
+	vector_data: impl Node<F, Output = VectorData>,
+) -> VectorData {
+	// Evaluate the vector data within the given footprint.
+	let mut vector_data = vector_data.eval(footprint).await;
 
-	vector_data.segment_domain.clear();
-
-	if points.positions().is_empty() {
+	// Exit early if there are no points to generate splines from.
+	if vector_data.point_domain.positions().is_empty() {
 		return vector_data;
 	}
 
-	let first_handles = bezier_rs::solve_spline_first_handle(points.positions());
+	let mut segment_domain = SegmentDomain::default();
+	for subpath in vector_data.stroke_bezier_paths() {
+		let positions = subpath.manipulator_groups().iter().map(|group| group.anchor).collect::<Vec<_>>();
+		let closed = subpath.closed() && positions.len() > 2;
 
-	let stroke_id = StrokeId::ZERO;
+		// Compute control point handles for Bezier spline.
+		let first_handles = if closed {
+			bezier_rs::solve_spline_first_handle_closed(&positions)
+		} else {
+			bezier_rs::solve_spline_first_handle_open(&positions)
+		};
 
-	for (start_index, end_index) in (0..(points.positions().len())).zip(1..(points.positions().len())) {
-		let handle_start = first_handles[start_index];
-		let handle_end = points.positions()[end_index] * 2. - first_handles[end_index];
-		let handles = bezier_rs::BezierHandles::Cubic { handle_start, handle_end };
+		let stroke_id = StrokeId::ZERO;
 
-		vector_data.segment_domain.push(SegmentId::generate(), start_index, end_index, handles, stroke_id)
+		// Create segments with computed Bezier handles and add them to vector data.
+		for i in 0..(positions.len() - if closed { 0 } else { 1 }) {
+			let next_index = (i + 1) % positions.len();
+
+			let start_index = vector_data.point_domain.resolve_id(subpath.manipulator_groups()[i].id).unwrap();
+			let end_index = vector_data.point_domain.resolve_id(subpath.manipulator_groups()[next_index].id).unwrap();
+
+			let handle_start = first_handles[i];
+			let handle_end = positions[next_index] * 2. - first_handles[next_index];
+			let handles = bezier_rs::BezierHandles::Cubic { handle_start, handle_end };
+
+			segment_domain.push(SegmentId::generate(), start_index, end_index, handles, stroke_id);
+		}
 	}
+	vector_data.segment_domain = segment_domain;
+
+	vector_data
+}
+
+#[node_macro::node(category("Vector"), path(graphene_core::vector))]
+async fn jitter_points<F: 'n + Send>(
+	#[implementations(
+		(),
+		Footprint,
+	)]
+	footprint: F,
+	#[implementations(
+		() -> VectorData,
+		Footprint -> VectorData,
+	)]
+	vector_data: impl Node<F, Output = VectorData>,
+	#[default(5.)] amount: f64,
+	seed: SeedValue,
+) -> VectorData {
+	let mut vector_data = vector_data.eval(footprint).await;
+
+	let mut rng = rand::rngs::StdRng::seed_from_u64(seed.into());
+
+	let deltas = (0..vector_data.point_domain.positions().len())
+		.map(|_| {
+			let angle = rng.gen::<f64>() * std::f64::consts::TAU;
+			DVec2::from_angle(angle) * rng.gen::<f64>() * amount
+		})
+		.collect::<Vec<_>>();
+	let mut already_applied = vec![false; vector_data.point_domain.positions().len()];
+
+	for (handles, start, end) in vector_data.segment_domain.handles_and_points_mut() {
+		let start_delta = deltas[*start];
+		let end_delta = deltas[*end];
+
+		if !already_applied[*start] {
+			let start_position = vector_data.point_domain.positions()[*start];
+			let start_position = vector_data.transform.transform_point2(start_position);
+			vector_data.point_domain.set_position(*start, start_position + start_delta);
+			already_applied[*start] = true;
+		}
+		if !already_applied[*end] {
+			let end_position = vector_data.point_domain.positions()[*end];
+			let end_position = vector_data.transform.transform_point2(end_position);
+			vector_data.point_domain.set_position(*end, end_position + end_delta);
+			already_applied[*end] = true;
+		}
+
+		match handles {
+			bezier_rs::BezierHandles::Cubic { handle_start, handle_end } => {
+				*handle_start = vector_data.transform.transform_point2(*handle_start) + start_delta;
+				*handle_end += vector_data.transform.transform_point2(*handle_end) + end_delta;
+			}
+			bezier_rs::BezierHandles::Quadratic { handle } => {
+				*handle += vector_data.transform.transform_point2(*handle) + (start_delta + end_delta) / 2.;
+			}
+			bezier_rs::BezierHandles::Linear => {}
+		}
+	}
+
+	vector_data.transform = DAffine2::IDENTITY;
+	vector_data.style.set_stroke_transform(DAffine2::IDENTITY);
 
 	vector_data
 }
@@ -858,6 +1053,130 @@ async fn morph<F: 'n + Send + Copy>(
 	}
 
 	result
+}
+
+fn bevel_algorithm(mut vector_data: VectorData, distance: f64) -> VectorData {
+	// Splits a bézier curve based on a distance measurement
+	fn split_distance(bezier: bezier_rs::Bezier, distance: f64, length: f64) -> bezier_rs::Bezier {
+		const EUCLIDEAN_ERROR: f64 = 0.001;
+		let parametric = bezier.euclidean_to_parametric_with_total_length((distance / length).clamp(0., 1.), EUCLIDEAN_ERROR, length);
+		bezier.split(bezier_rs::TValue::Parametric(parametric))[1]
+	}
+
+	/// Produces a list that correspons with the point id. The value is how many segments are connected.
+	fn segments_connected_count(vector_data: &VectorData) -> Vec<u8> {
+		// Count the number of segments connectign to each point.
+		let mut segments_connected_count = vec![0; vector_data.point_domain.ids().len()];
+		for &point_index in vector_data.segment_domain.start_point().iter().chain(vector_data.segment_domain.end_point()) {
+			segments_connected_count[point_index] += 1;
+		}
+
+		// Zero out points without exactly two connectors. These are ignored
+		for count in &mut segments_connected_count {
+			if *count != 2 {
+				*count = 0;
+			}
+		}
+		segments_connected_count
+	}
+
+	/// Updates the index so that it points at a point with the position. If nobody else will look at the index, the original point is updated. Otherwise a new point is created.
+	fn create_or_modify_point(point_domain: &mut PointDomain, segments_connected_count: &mut [u8], pos: DVec2, index: &mut usize, next_id: &mut PointId, new_segments: &mut Vec<[usize; 2]>) {
+		segments_connected_count[*index] -= 1;
+		if segments_connected_count[*index] == 0 {
+			// If nobody else is going to look at this point, we're alright to modify it
+			point_domain.set_position(*index, pos);
+		} else {
+			let new_index = point_domain.ids().len();
+			let original_index = *index;
+
+			// Create a new point (since someone will wish to look at the point in the original position in future)
+			*index = new_index;
+			point_domain.push(next_id.next_id(), pos);
+
+			// Add a new segment to be created later
+			new_segments.push([new_index, original_index])
+		}
+	}
+
+	fn update_existing_segments(vector_data: &mut VectorData, distance: f64, segments_connected: &mut [u8]) -> Vec<[usize; 2]> {
+		let mut next_id = vector_data.point_domain.next_id();
+		let mut new_segments = Vec::new();
+
+		for (handles, start_point_index, end_point_index) in vector_data.segment_domain.handles_and_points_mut() {
+			// Convert the original segment to a bezier
+			let mut bezier = bezier_rs::Bezier {
+				start: vector_data.point_domain.positions()[*start_point_index],
+				end: vector_data.point_domain.positions()[*end_point_index],
+				handles: *handles,
+			};
+
+			if bezier.is_linear() {
+				bezier.handles = bezier_rs::BezierHandles::Linear;
+			}
+			bezier = bezier.apply_transformation(|p| vector_data.transform.transform_point2(p));
+			let inverse_transform = (vector_data.transform.matrix2.determinant() != 0.).then(|| vector_data.transform.inverse()).unwrap_or_default();
+
+			let original_length = bezier.length(None);
+			let mut length = original_length;
+
+			// Only split if the length is big enough to make it worthwhile
+			let valid_length = length > 1e-10;
+			if segments_connected[*start_point_index] > 0 && valid_length {
+				// Apply the bevel to the start
+				let distance = distance.min(original_length / 2.);
+				bezier = split_distance(bezier, distance, length);
+				length = (length - distance).max(0.);
+				// Update the start position
+				let pos = inverse_transform.transform_point2(bezier.start);
+				create_or_modify_point(&mut vector_data.point_domain, segments_connected, pos, start_point_index, &mut next_id, &mut new_segments);
+			}
+
+			// Only split if the length is big enough to make it worthwhile
+			let valid_length = length > 1e-10;
+			if segments_connected[*end_point_index] > 0 && valid_length {
+				// Apply the bevel to the end
+				let distance = distance.min(original_length / 2.);
+				bezier = split_distance(bezier.reversed(), distance, length).reversed();
+				// Update the end position
+				let pos = inverse_transform.transform_point2(bezier.end);
+				create_or_modify_point(&mut vector_data.point_domain, segments_connected, pos, end_point_index, &mut next_id, &mut new_segments);
+			}
+			// Update the handles
+			*handles = bezier.handles.apply_transformation(|p| inverse_transform.transform_point2(p));
+		}
+		new_segments
+	}
+
+	fn insert_new_segments(vector_data: &mut VectorData, new_segments: &[[usize; 2]]) {
+		let mut next_id = vector_data.segment_domain.next_id();
+		for &[start, end] in new_segments {
+			vector_data.segment_domain.push(next_id.next_id(), start, end, bezier_rs::BezierHandles::Linear, StrokeId::ZERO);
+		}
+	}
+
+	let mut segments_connected = segments_connected_count(&vector_data);
+	let new_segments = update_existing_segments(&mut vector_data, distance, &mut segments_connected);
+	insert_new_segments(&mut vector_data, &new_segments);
+
+	vector_data
+}
+
+#[node_macro::node(category("Vector"), path(graphene_core::vector))]
+async fn bevel<F: 'n + Send + Copy>(
+	#[implementations(
+		(),
+		Footprint,
+	)]
+	footprint: F,
+	#[implementations(
+		() -> VectorData,
+		Footprint -> VectorData,
+	)]
+	source: impl Node<F, Output = VectorData>,
+	#[default(10.)] distance: Length,
+) -> VectorData {
+	bevel_algorithm(source.eval(footprint).await, distance)
 }
 
 #[node_macro::node(category("Vector"), path(graphene_core::vector))]
@@ -1058,10 +1377,9 @@ mod test {
 		let lengths = subpath_segment_lengths(Footprint::default(), &vector_node(subpath)).await;
 		assert_eq!(lengths, vec![100.]);
 	}
-	#[test]
-	fn spline() {
-		let subpath = VectorData::from_subpath(Subpath::new_rect(DVec2::ZERO, DVec2::ONE * 100.));
-		let spline = splines_from_points((), subpath);
+	#[tokio::test]
+	async fn spline() {
+		let spline = splines_from_points(Footprint::default(), &vector_node(Subpath::new_rect(DVec2::ZERO, DVec2::ONE * 100.))).await;
 		assert_eq!(spline.stroke_bezier_paths().count(), 1);
 		assert_eq!(spline.point_domain.positions(), &[DVec2::ZERO, DVec2::new(100., 0.), DVec2::new(100., 100.), DVec2::new(0., 100.)]);
 	}
@@ -1074,5 +1392,108 @@ mod test {
 			&sample_points.point_domain.positions()[..4],
 			vec![DVec2::new(-25., -50.), DVec2::new(50., -25.), DVec2::new(25., 50.), DVec2::new(-50., 25.)]
 		);
+	}
+
+	#[track_caller]
+	fn contains_segment(vector: &VectorData, target: bezier_rs::Bezier) {
+		let segments = vector.segment_bezier_iter().map(|x| x.1);
+		let count = segments.filter(|bezier| bezier.abs_diff_eq(&target, 0.01) || bezier.reversed().abs_diff_eq(&target, 0.01)).count();
+		assert_eq!(count, 1, "Incorrect number of {target:#?} in {:#?}", vector.segment_bezier_iter().collect::<Vec<_>>());
+	}
+
+	#[tokio::test]
+	async fn bevel_rect() {
+		let source = Subpath::new_rect(DVec2::ZERO, DVec2::ONE * 100.);
+		let beveled = super::bevel(Footprint::default(), &vector_node(source), 5.).await;
+		assert_eq!(beveled.point_domain.positions().len(), 8);
+		assert_eq!(beveled.segment_domain.ids().len(), 8);
+
+		// Segments
+		contains_segment(&beveled, bezier_rs::Bezier::from_linear_dvec2(DVec2::new(5., 0.), DVec2::new(95., 0.)));
+		contains_segment(&beveled, bezier_rs::Bezier::from_linear_dvec2(DVec2::new(5., 100.), DVec2::new(95., 100.)));
+		contains_segment(&beveled, bezier_rs::Bezier::from_linear_dvec2(DVec2::new(0., 5.), DVec2::new(0., 95.)));
+		contains_segment(&beveled, bezier_rs::Bezier::from_linear_dvec2(DVec2::new(100., 5.), DVec2::new(100., 95.)));
+
+		// Joins
+		contains_segment(&beveled, bezier_rs::Bezier::from_linear_dvec2(DVec2::new(5., 0.), DVec2::new(0., 5.)));
+		contains_segment(&beveled, bezier_rs::Bezier::from_linear_dvec2(DVec2::new(95., 0.), DVec2::new(100., 5.)));
+		contains_segment(&beveled, bezier_rs::Bezier::from_linear_dvec2(DVec2::new(100., 95.), DVec2::new(95., 100.)));
+		contains_segment(&beveled, bezier_rs::Bezier::from_linear_dvec2(DVec2::new(5., 100.), DVec2::new(0., 95.)));
+	}
+
+	#[tokio::test]
+	async fn bevel_open_curve() {
+		let curve = Bezier::from_cubic_dvec2(DVec2::ZERO, DVec2::new(10., 0.), DVec2::new(10., 100.), DVec2::X * 100.);
+		let source = Subpath::from_beziers(&[Bezier::from_linear_dvec2(DVec2::X * -100., DVec2::ZERO), curve], false);
+		let beveled = super::bevel(Footprint::default(), &vector_node(source), 5.).await;
+
+		assert_eq!(beveled.point_domain.positions().len(), 4);
+		assert_eq!(beveled.segment_domain.ids().len(), 3);
+
+		// Segments
+		contains_segment(&beveled, bezier_rs::Bezier::from_linear_dvec2(DVec2::new(-5., 0.), DVec2::new(-100., 0.)));
+		let trimmed = curve.trim(bezier_rs::TValue::Euclidean(5. / curve.length(Some(0.00001))), bezier_rs::TValue::Parametric(1.));
+		contains_segment(&beveled, trimmed);
+
+		// Join
+		contains_segment(&beveled, bezier_rs::Bezier::from_linear_dvec2(DVec2::new(-5., 0.), trimmed.start));
+	}
+
+	#[tokio::test]
+	async fn bevel_with_transform() {
+		let curve = Bezier::from_cubic_dvec2(DVec2::ZERO, DVec2::new(1., 0.), DVec2::new(1., 10.), DVec2::X * 10.);
+		let source = Subpath::<PointId>::from_beziers(&[Bezier::from_linear_dvec2(DVec2::X * -10., DVec2::ZERO), curve], false);
+		let mut vector_data = VectorData::from_subpath(source);
+		let transform = DAffine2::from_scale_angle_translation(DVec2::splat(10.), 1., DVec2::new(99., 77.));
+		vector_data.transform = transform;
+		let beveled = super::bevel(Footprint::default(), &FutureWrapperNode(vector_data), 5.).await;
+
+		assert_eq!(beveled.point_domain.positions().len(), 4);
+		assert_eq!(beveled.segment_domain.ids().len(), 3);
+		assert_eq!(beveled.transform, transform);
+
+		// Segments
+		contains_segment(&beveled, bezier_rs::Bezier::from_linear_dvec2(DVec2::new(-0.5, 0.), DVec2::new(-10., 0.)));
+		let trimmed = curve.trim(bezier_rs::TValue::Euclidean(0.5 / curve.length(Some(0.00001))), bezier_rs::TValue::Parametric(1.));
+		contains_segment(&beveled, trimmed);
+
+		// Join
+		contains_segment(&beveled, bezier_rs::Bezier::from_linear_dvec2(DVec2::new(-0.5, 0.), trimmed.start));
+	}
+
+	#[tokio::test]
+	async fn bevel_too_high() {
+		let source = Subpath::from_anchors([DVec2::ZERO, DVec2::new(100., 0.), DVec2::new(100., 100.), DVec2::new(0., 100.)], false);
+		let beveled = super::bevel(Footprint::default(), &vector_node(source), 999.).await;
+		assert_eq!(beveled.point_domain.positions().len(), 6);
+		assert_eq!(beveled.segment_domain.ids().len(), 5);
+
+		// Segments
+		contains_segment(&beveled, bezier_rs::Bezier::from_linear_dvec2(DVec2::new(0., 0.), DVec2::new(50., 0.)));
+		contains_segment(&beveled, bezier_rs::Bezier::from_linear_dvec2(DVec2::new(100., 50.), DVec2::new(100., 50.)));
+		contains_segment(&beveled, bezier_rs::Bezier::from_linear_dvec2(DVec2::new(100., 50.), DVec2::new(50., 100.)));
+
+		// Joins
+		contains_segment(&beveled, bezier_rs::Bezier::from_linear_dvec2(DVec2::new(50., 0.), DVec2::new(100., 50.)));
+		contains_segment(&beveled, bezier_rs::Bezier::from_linear_dvec2(DVec2::new(100., 50.), DVec2::new(50., 100.)));
+	}
+
+	#[tokio::test]
+	async fn bevel_repeated_point() {
+		let curve = Bezier::from_cubic_dvec2(DVec2::ZERO, DVec2::new(10., 0.), DVec2::new(10., 100.), DVec2::X * 100.);
+		let point = Bezier::from_cubic_dvec2(DVec2::ZERO, DVec2::ZERO, DVec2::ZERO, DVec2::ZERO);
+		let source = Subpath::from_beziers(&[Bezier::from_linear_dvec2(DVec2::X * -100., DVec2::ZERO), point, curve], false);
+		let beveled = super::bevel(Footprint::default(), &vector_node(source), 5.).await;
+
+		assert_eq!(beveled.point_domain.positions().len(), 6);
+		assert_eq!(beveled.segment_domain.ids().len(), 5);
+
+		// Segments
+		contains_segment(&beveled, bezier_rs::Bezier::from_linear_dvec2(DVec2::new(-100., 0.), DVec2::new(-5., 0.)));
+		contains_segment(&beveled, bezier_rs::Bezier::from_linear_dvec2(DVec2::new(-5., 0.), DVec2::new(0., 0.)));
+		contains_segment(&beveled, point);
+		let [start, end] = curve.split(bezier_rs::TValue::Euclidean(5. / curve.length(Some(0.00001))));
+		contains_segment(&beveled, bezier_rs::Bezier::from_linear_dvec2(start.start, start.end));
+		contains_segment(&beveled, end);
 	}
 }

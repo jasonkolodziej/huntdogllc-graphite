@@ -107,8 +107,8 @@ impl MessageHandler<NavigationMessage, NavigationMessageData<'_>> for Navigation
 					});
 
 					self.navigation_operation = NavigationOperation::Tilt {
-						tilt_original_for_abort: ptz.tilt,
-						tilt_raw_not_snapped: ptz.tilt,
+						tilt_original_for_abort: ptz.tilt(),
+						tilt_raw_not_snapped: ptz.tilt(),
 						snap: false,
 					};
 
@@ -179,9 +179,13 @@ impl MessageHandler<NavigationMessage, NavigationMessageData<'_>> for Navigation
 					log::error!("Could not get mutable PTZ in CanvasTiltResetAndZoomTo100Percent");
 					return;
 				};
-				ptz.tilt = 0.;
+				ptz.set_tilt(0.);
 				ptz.set_zoom(1.);
-				responses.add(PortfolioMessage::UpdateDocumentWidgets);
+				if graph_view_overlay_open {
+					responses.add(NodeGraphMessage::UpdateGraphBarRight);
+				} else {
+					responses.add(PortfolioMessage::UpdateDocumentWidgets);
+				}
 				responses.add(DocumentMessage::PTZUpdate);
 				responses.add(NodeGraphMessage::SetGridAlignedEdges);
 			}
@@ -190,8 +194,11 @@ impl MessageHandler<NavigationMessage, NavigationMessageData<'_>> for Navigation
 					log::error!("Could not get mutable PTZ in CanvasTiltSet");
 					return;
 				};
-				ptz.tilt = angle_radians;
+				ptz.set_tilt(angle_radians);
 				responses.add(DocumentMessage::PTZUpdate);
+				if !graph_view_overlay_open {
+					responses.add(PortfolioMessage::UpdateDocumentWidgets);
+				}
 			}
 			NavigationMessage::CanvasZoomDecrease { center_on_mouse } => {
 				let Some(ptz) = get_ptz(document_ptz, network_interface, graph_view_overlay_open, breadcrumb_network_path) else {
@@ -252,7 +259,11 @@ impl MessageHandler<NavigationMessage, NavigationMessageData<'_>> for Navigation
 				let zoom = zoom_factor.clamp(VIEWPORT_ZOOM_SCALE_MIN, VIEWPORT_ZOOM_SCALE_MAX);
 				let zoom = zoom * Self::clamp_zoom(zoom, document_bounds, old_zoom, ipp);
 				ptz.set_zoom(zoom);
-				responses.add(PortfolioMessage::UpdateDocumentWidgets);
+				if graph_view_overlay_open {
+					responses.add(NodeGraphMessage::UpdateGraphBarRight);
+				} else {
+					responses.add(PortfolioMessage::UpdateDocumentWidgets);
+				}
 				responses.add(DocumentMessage::PTZUpdate);
 				responses.add(NodeGraphMessage::SetGridAlignedEdges);
 			}
@@ -266,7 +277,7 @@ impl MessageHandler<NavigationMessage, NavigationMessageData<'_>> for Navigation
 					match self.navigation_operation {
 						NavigationOperation::None => {}
 						NavigationOperation::Tilt { tilt_original_for_abort, .. } => {
-							ptz.tilt = tilt_original_for_abort;
+							ptz.set_tilt(tilt_original_for_abort);
 						}
 						NavigationOperation::Pan { pan_original_for_abort, .. } => {
 							ptz.pan = pan_original_for_abort;
@@ -278,9 +289,14 @@ impl MessageHandler<NavigationMessage, NavigationMessageData<'_>> for Navigation
 				}
 
 				// Final chance to apply snapping if the key was pressed during this final frame
-				ptz.tilt = self.snapped_tilt(ptz.tilt);
+				ptz.set_tilt(self.snapped_tilt(ptz.tilt()));
 				ptz.set_zoom(self.snapped_zoom(ptz.zoom()));
 				responses.add(DocumentMessage::PTZUpdate);
+				if graph_view_overlay_open {
+					responses.add(NodeGraphMessage::UpdateGraphBarRight);
+				} else {
+					responses.add(PortfolioMessage::UpdateDocumentWidgets);
+				}
 				responses.add(NodeGraphMessage::SetGridAlignedEdges);
 				// Reset the navigation operation now that it's done
 				self.navigation_operation = NavigationOperation::None;
@@ -305,6 +321,7 @@ impl MessageHandler<NavigationMessage, NavigationMessageData<'_>> for Navigation
 				let diagonal = pos2 - pos1;
 
 				if diagonal.length() < f64::EPSILON * 1000. || ipp.viewport_bounds.size() == DVec2::ZERO {
+					warn!("Cannot center since the viewport size is 0");
 					return;
 				}
 
@@ -336,7 +353,11 @@ impl MessageHandler<NavigationMessage, NavigationMessageData<'_>> for Navigation
 					ptz.set_zoom(1.);
 				}
 
-				responses.add(PortfolioMessage::UpdateDocumentWidgets);
+				if graph_view_overlay_open {
+					responses.add(NodeGraphMessage::UpdateGraphBarRight);
+				} else {
+					responses.add(PortfolioMessage::UpdateDocumentWidgets);
+				}
 				responses.add(DocumentMessage::PTZUpdate);
 				responses.add(NodeGraphMessage::SetGridAlignedEdges);
 			}
@@ -377,7 +398,7 @@ impl MessageHandler<NavigationMessage, NavigationMessageData<'_>> for Navigation
 							log::error!("Could not get mutable PTZ in Tilt");
 							return;
 						};
-						ptz.tilt = self.snapped_tilt(tilt_raw_not_snapped);
+						ptz.set_tilt(self.snapped_tilt(tilt_raw_not_snapped));
 
 						let snap = ipp.keyboard.get(snap as usize);
 
@@ -387,7 +408,7 @@ impl MessageHandler<NavigationMessage, NavigationMessageData<'_>> for Navigation
 							snap,
 						};
 
-						responses.add(NavigationMessage::CanvasTiltSet { angle_radians: ptz.tilt });
+						responses.add(NavigationMessage::CanvasTiltSet { angle_radians: ptz.tilt() });
 					}
 					NavigationOperation::Zoom {
 						zoom_raw_not_snapped,
@@ -478,16 +499,12 @@ impl NavigationMessageHandler {
 	}
 
 	pub fn snapped_zoom(&self, zoom: f64) -> f64 {
-		if matches!(self.navigation_operation, NavigationOperation::Zoom { snap: true, .. }) {
-			*VIEWPORT_ZOOM_LEVELS.iter().min_by(|a, b| (**a - zoom).abs().partial_cmp(&(**b - zoom).abs()).unwrap()).unwrap_or(&zoom)
-		} else {
-			zoom
-		}
+		snapped_zoom(&self.navigation_operation, zoom)
 	}
 
 	pub fn calculate_offset_transform(&self, viewport_center: DVec2, ptz: &PTZ) -> DAffine2 {
 		let pan = ptz.pan;
-		let tilt = ptz.tilt;
+		let tilt = ptz.tilt();
 		let zoom = ptz.zoom();
 
 		let scaled_center = viewport_center / self.snapped_zoom(zoom);
@@ -521,5 +538,13 @@ impl NavigationMessageHandler {
 		}
 
 		VIEWPORT_ZOOM_MIN_FRACTION_COVER / scale_factor
+	}
+}
+
+pub fn snapped_zoom(navigation_operation: &NavigationOperation, zoom: f64) -> f64 {
+	if matches!(navigation_operation, NavigationOperation::Zoom { snap: true, .. }) {
+		*VIEWPORT_ZOOM_LEVELS.iter().min_by(|a, b| (**a - zoom).abs().partial_cmp(&(**b - zoom).abs()).unwrap()).unwrap_or(&zoom)
+	} else {
+		zoom
 	}
 }

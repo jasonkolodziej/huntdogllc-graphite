@@ -2,7 +2,6 @@ use crate::messages::layout::utility_types::widget_prelude::*;
 use crate::messages::prelude::*;
 
 use graph_craft::document::NodeId;
-use graphene_core::uuid::generate_uuid;
 
 use glam::{IVec2, UVec2};
 
@@ -26,18 +25,18 @@ impl MessageHandler<NewDocumentDialogMessage, ()> for NewDocumentDialogMessageHa
 
 				let create_artboard = !self.infinite && self.dimensions.x > 0 && self.dimensions.y > 0;
 				if create_artboard {
+					responses.add(Message::StartBuffer);
 					responses.add(GraphOperationMessage::NewArtboard {
-						id: NodeId(generate_uuid()),
+						id: NodeId::new(),
 						artboard: graphene_core::Artboard::new(IVec2::ZERO, self.dimensions.as_ivec2()),
 					});
 				}
 
-				responses.add(NodeGraphMessage::RunDocumentGraph);
-				responses.add(NodeGraphMessage::UpdateNewNodeGraph);
-
 				// TODO: Figure out how to get StartBuffer to work here so we can delete this and use `DocumentMessage::ZoomCanvasToFitAll` instead
+				// Currently, it is necessary to use `FrontendMessage::TriggerDelayedZoomCanvasToFitAll` rather than `DocumentMessage::ZoomCanvasToFitAll` because the size of the viewport is not yet populated
 				responses.add(Message::StartBuffer);
 				responses.add(FrontendMessage::TriggerDelayedZoomCanvasToFitAll);
+				responses.add(DocumentMessage::DeselectAllLayers);
 			}
 		}
 

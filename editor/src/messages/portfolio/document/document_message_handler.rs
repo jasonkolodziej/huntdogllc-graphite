@@ -39,44 +39,7 @@ pub struct DocumentMessageData<'a> {
 	pub ipp: &'a InputPreprocessorMessageHandler,
 	pub persistent_data: &'a PersistentData,
 	pub executor: &'a mut NodeGraphExecutor,
-}
-
-// TODO: Eventually remove this (probably starting late 2024)
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct OldDocumentMessageHandler {
-	// ============================================
-	// Fields that are saved in the document format
-	// ============================================
-	//
-	/// The node graph that generates this document's artwork.
-	/// It recursively stores its sub-graphs, so this root graph is the whole snapshot of the document content.
-	pub network: OldNodeNetwork,
-	/// List of the [`NodeId`]s that are currently selected by the user.
-	pub selected_nodes: SelectedNodes,
-	/// List of the [`LayerNodeIdentifier`]s that are currently collapsed by the user in the Layers panel.
-	/// Collapsed means that the expansion arrow isn't set to show the children of these layers.
-	pub collapsed: CollapsedLayers,
-	/// The name of the document, which is displayed in the tab and title bar of the editor.
-	pub name: String,
-	/// The full Git commit hash of the Graphite repository that was used to build the editor.
-	/// We save this to provide a hint about which version of the editor was used to create the document.
-	pub commit_hash: String,
-	/// The current pan, tilt, and zoom state of the viewport's view of the document canvas.
-	pub document_ptz: PTZ,
-	/// The current mode that the document is in, which starts out as Design Mode. This choice affects the editing behavior of the tools.
-	pub document_mode: DocumentMode,
-	/// The current view mode that the user has set for rendering the document within the viewport.
-	/// This is usually "Normal" but can be set to "Outline" or "Pixels" to see the canvas differently.
-	pub view_mode: ViewMode,
-	/// Sets whether or not all the viewport overlays should be drawn on top of the artwork.
-	/// This includes tool interaction visualizations (like the transform cage and path anchors/handles), the grid, and more.
-	pub overlays_visible: bool,
-	/// Sets whether or not the rulers should be drawn along the top and left edges of the viewport area.
-	pub rulers_visible: bool,
-	/// Sets whether or not the node graph is drawn (as an overlay) on top of the viewport area, or otherwise if it's hidden.
-	pub graph_view_overlay_open: bool,
-	/// The current user choices for snapping behavior, including whether snapping is enabled at all.
-	pub snapping_state: SnappingState,
+	pub current_tool: &'a ToolType,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -121,10 +84,12 @@ pub struct DocumentMessageHandler {
 	pub overlays_visible: bool,
 	/// Sets whether or not the rulers should be drawn along the top and left edges of the viewport area.
 	pub rulers_visible: bool,
-	/// Sets whether or not the node graph is drawn (as an overlay) on top of the viewport area, or otherwise if it's hidden.
-	pub graph_view_overlay_open: bool,
 	/// The current user choices for snapping behavior, including whether snapping is enabled at all.
 	pub snapping_state: SnappingState,
+	/// Sets whether or not the node graph is drawn (as an overlay) on top of the viewport area, or otherwise if it's hidden.
+	pub graph_view_overlay_open: bool,
+	/// The current opacity of the faded node graph background that covers up the artwork.
+	pub graph_fade_artwork_percentage: f64,
 
 	// =============================================
 	// Fields omitted from the saved document format
@@ -178,6 +143,7 @@ impl Default for DocumentMessageHandler {
 			rulers_visible: true,
 			graph_view_overlay_open: false,
 			snapping_state: SnappingState::default(),
+			graph_fade_artwork_percentage: 80.,
 			// =============================================
 			// Fields omitted from the saved document format
 			// =============================================
@@ -199,6 +165,7 @@ impl MessageHandler<DocumentMessage, DocumentMessageData<'_>> for DocumentMessag
 			ipp,
 			persistent_data,
 			executor,
+			current_tool,
 		} = data;
 
 		let selected_nodes_bounding_box_viewport = self.network_interface.selected_nodes_bounding_box_viewport(&self.breadcrumb_network_path);
@@ -228,7 +195,7 @@ impl MessageHandler<DocumentMessage, DocumentMessageData<'_>> for DocumentMessag
 			DocumentMessage::PropertiesPanel(message) => {
 				let properties_panel_message_handler_data = PropertiesPanelMessageHandlerData {
 					network_interface: &self.network_interface,
-					selection_path: &self.selection_network_path,
+					selection_network_path: &self.selection_network_path,
 					document_name: self.name.as_str(),
 					executor,
 				};
@@ -247,6 +214,8 @@ impl MessageHandler<DocumentMessage, DocumentMessageData<'_>> for DocumentMessag
 						collapsed: &mut self.collapsed,
 						ipp,
 						graph_view_overlay_open: self.graph_view_overlay_open,
+						graph_fade_artwork_percentage: self.graph_fade_artwork_percentage,
+						navigation_handler: &self.navigation_handler,
 					},
 				);
 			}
@@ -322,7 +291,7 @@ impl MessageHandler<DocumentMessage, DocumentMessageData<'_>> for DocumentMessag
 				};
 				let insert_index = DocumentMessageHandler::get_calculated_insert_index(self.metadata(), self.network_interface.selected_nodes(&[]).unwrap(), parent);
 
-				let folder_id = NodeId(generate_uuid());
+				let folder_id = NodeId::new();
 				let boolean_operation_layer = LayerNodeIdentifier::new_unchecked(folder_id);
 				responses.add(GraphOperationMessage::NewBooleanOperationLayer {
 					id: folder_id,
@@ -338,7 +307,7 @@ impl MessageHandler<DocumentMessage, DocumentMessageData<'_>> for DocumentMessag
 				responses.add(DocumentMessage::MoveSelectedLayersToGroup { parent: boolean_operation_layer });
 			}
 			DocumentMessage::CreateEmptyFolder => {
-				let id = NodeId(generate_uuid());
+				let id = NodeId::new();
 
 				let parent = self
 					.network_interface
@@ -357,7 +326,19 @@ impl MessageHandler<DocumentMessage, DocumentMessageData<'_>> for DocumentMessag
 				responses.add(NodeGraphMessage::SelectedNodesSet { nodes: vec![id] });
 			}
 			DocumentMessage::DebugPrintDocument => {
-				info!("{:#?}", self.network_interface);
+				info!("{:?}", self.network_interface);
+			}
+			DocumentMessage::DeleteNode { node_id } => {
+				responses.add(DocumentMessage::StartTransaction);
+
+				responses.add(NodeGraphMessage::DeleteNodes {
+					node_ids: vec![node_id],
+					delete_children: true,
+				});
+				responses.add(NodeGraphMessage::RunDocumentGraph);
+				responses.add(NodeGraphMessage::SelectedNodesUpdated);
+				responses.add(NodeGraphMessage::SendGraph);
+				responses.add(DocumentMessage::EndTransaction);
 			}
 			DocumentMessage::DeleteSelectedLayers => {
 				responses.add(NodeGraphMessage::DeleteSelectedNodes { delete_children: true });
@@ -466,15 +447,25 @@ impl MessageHandler<DocumentMessage, DocumentMessageData<'_>> for DocumentMessag
 			DocumentMessage::GraphViewOverlay { open } => {
 				self.graph_view_overlay_open = open;
 
-				responses.add(FrontendMessage::TriggerGraphViewOverlay { open });
+				responses.add(FrontendMessage::UpdateGraphViewOverlay { open });
+				responses.add(FrontendMessage::UpdateGraphFadeArtwork {
+					percentage: self.graph_fade_artwork_percentage,
+				});
+
 				// Update the tilt menu bar buttons to be disabled when the graph is open
 				responses.add(MenuBarMessage::SendLayout);
+
 				responses.add(DocumentMessage::RenderRulers);
 				responses.add(DocumentMessage::RenderScrollbars);
 				if open {
+					responses.add(ToolMessage::DeactivateTools);
+					responses.add(OverlaysMessage::Draw); // Clear the overlays
 					responses.add(NavigationMessage::CanvasTiltSet { angle_radians: 0. });
 					responses.add(NodeGraphMessage::SetGridAlignedEdges);
+					responses.add(NodeGraphMessage::UpdateGraphBarRight);
 					responses.add(NodeGraphMessage::SendGraph);
+				} else {
+					responses.add(ToolMessage::ActivateTool { tool_type: *current_tool });
 				}
 			}
 			DocumentMessage::GraphViewOverlayToggle => {
@@ -505,7 +496,7 @@ impl MessageHandler<DocumentMessage, DocumentMessageData<'_>> for DocumentMessag
 				};
 				let insert_index = DocumentMessageHandler::get_calculated_insert_index(self.metadata(), self.network_interface.selected_nodes(&[]).unwrap(), parent);
 
-				let node_id = NodeId(generate_uuid());
+				let node_id = NodeId::new();
 				let new_group_node = document_node_definitions::resolve_document_node_type("Merge")
 					.expect("Failed to create merge node")
 					.default_node_template();
@@ -660,62 +651,77 @@ impl MessageHandler<DocumentMessage, DocumentMessageData<'_>> for DocumentMessag
 			} => {
 				responses.add(DocumentMessage::AddTransaction);
 
-				let opposite_corner = ipp.keyboard.key(resize_opposite_corner);
-				let delta = DVec2::new(delta_x, delta_y);
-				let network_interface = &self.network_interface;
-				let can_move = move |layer| {
-					network_interface
+				let resize = ipp.keyboard.key(resize);
+				let resize_opposite_corner = ipp.keyboard.key(resize_opposite_corner);
+
+				let can_move = |layer| {
+					self.network_interface
 						.selected_nodes(&[])
-						.is_some_and(|selected| selected.layer_visible(layer, network_interface) && !selected.layer_locked(layer, network_interface))
+						.is_some_and(|selected| selected.layer_visible(layer, &self.network_interface) && !selected.layer_locked(layer, &self.network_interface))
 				};
 
-				match ipp.keyboard.key(resize) {
-					// Nudge translation
-					false => {
-						for layer in self.network_interface.shallowest_unique_layers(&[]).filter(|layer| can_move(*layer)) {
-							responses.add(GraphOperationMessage::TransformChange {
-								layer,
-								transform: DAffine2::from_translation(delta),
-								transform_in: TransformIn::Local,
-								skip_rerender: false,
-							});
-						}
+				// Nudge translation without resizing
+				if !resize {
+					let transform = DAffine2::from_translation(DVec2::from_angle(-self.document_ptz.tilt()).rotate(DVec2::new(delta_x, delta_y)));
+
+					for layer in self.network_interface.shallowest_unique_layers(&[]).filter(|layer| can_move(*layer)) {
+						responses.add(GraphOperationMessage::TransformChange {
+							layer,
+							transform,
+							transform_in: TransformIn::Local,
+							skip_rerender: false,
+						});
 					}
-					// Nudge resize
-					true => {
-						let selected_bounding_box = self.network_interface.selected_bounds_document_space(false, &[]);
-						let Some([existing_top_left, existing_bottom_right]) = selected_bounding_box else { return };
 
-						let size = existing_bottom_right - existing_top_left;
-						let new_size = size + if opposite_corner { -delta } else { delta };
-						let enlargement_factor = new_size / size;
+					return;
+				}
 
-						let position = existing_top_left + if opposite_corner { delta } else { DVec2::ZERO };
-						let mut pivot = (existing_top_left * enlargement_factor - position) / (enlargement_factor - DVec2::splat(1.));
-						if !pivot.x.is_finite() {
-							pivot.x = 0.;
-						}
-						if !pivot.y.is_finite() {
-							pivot.y = 0.;
-						}
+				let selected_bounding_box = self.network_interface.selected_bounds_document_space(false, &[]);
+				let Some([existing_top_left, existing_bottom_right]) = selected_bounding_box else { return };
 
-						let scale = DAffine2::from_scale(enlargement_factor);
-						let pivot = DAffine2::from_translation(pivot);
-						let transformation = pivot * scale * pivot.inverse();
-						let document_to_viewport = self.navigation_handler.calculate_offset_transform(ipp.viewport_bounds.center(), &self.document_ptz);
+				// Swap and negate coordinates as needed to match the resize direction that's closest to the current tilt angle
+				let tilt = (self.document_ptz.tilt() + std::f64::consts::TAU) % std::f64::consts::TAU;
+				let (delta_x, delta_y, opposite_x, opposite_y) = match ((tilt + std::f64::consts::FRAC_PI_4) / std::f64::consts::FRAC_PI_2).floor() as i32 % 4 {
+					0 => (delta_x, delta_y, false, false),
+					1 => (delta_y, -delta_x, false, true),
+					2 => (-delta_x, -delta_y, true, true),
+					3 => (-delta_y, delta_x, true, false),
+					_ => unreachable!(),
+				};
 
-						for layer in self.network_interface.shallowest_unique_layers(&[]).filter(|layer| can_move(*layer)) {
-							let to = document_to_viewport.inverse() * self.metadata().downstream_transform_to_viewport(layer);
-							let original_transform = self.metadata().upstream_transform(layer.to_node());
-							let new = to.inverse() * transformation * to * original_transform;
-							responses.add(GraphOperationMessage::TransformSet {
-								layer,
-								transform: new,
-								transform_in: TransformIn::Local,
-								skip_rerender: false,
-							});
-						}
-					}
+				let size = existing_bottom_right - existing_top_left;
+				let enlargement = DVec2::new(
+					if resize_opposite_corner != opposite_x { -delta_x } else { delta_x },
+					if resize_opposite_corner != opposite_y { -delta_y } else { delta_y },
+				);
+				let enlargement_factor = (enlargement + size) / size;
+
+				let position = DVec2::new(
+					existing_top_left.x + if resize_opposite_corner != opposite_x { delta_x } else { 0. },
+					existing_top_left.y + if resize_opposite_corner != opposite_y { delta_y } else { 0. },
+				);
+				let mut pivot = (existing_top_left * enlargement_factor - position) / (enlargement_factor - DVec2::ONE);
+				if !pivot.x.is_finite() {
+					pivot.x = 0.;
+				}
+				if !pivot.y.is_finite() {
+					pivot.y = 0.;
+				}
+				let scale = DAffine2::from_scale(enlargement_factor);
+				let pivot = DAffine2::from_translation(pivot);
+				let transformation = pivot * scale * pivot.inverse();
+				let document_to_viewport = self.navigation_handler.calculate_offset_transform(ipp.viewport_bounds.center(), &self.document_ptz);
+
+				for layer in self.network_interface.shallowest_unique_layers(&[]).filter(|layer| can_move(*layer)) {
+					let to = document_to_viewport.inverse() * self.metadata().downstream_transform_to_viewport(layer);
+					let original_transform = self.metadata().upstream_transform(layer.to_node());
+					let new = to.inverse() * transformation * to * original_transform;
+					responses.add(GraphOperationMessage::TransformSet {
+						layer,
+						transform: new,
+						transform_in: TransformIn::Local,
+						skip_rerender: false,
+					});
 				}
 			}
 			DocumentMessage::PasteImage {
@@ -740,7 +746,7 @@ impl MessageHandler<DocumentMessage, DocumentMessageData<'_>> for DocumentMessag
 
 				let transform = center_in_viewport_layerspace * fit_image_size;
 
-				let layer_node_id = NodeId(generate_uuid());
+				let layer_node_id = NodeId::new();
 				let layer_id = LayerNodeIdentifier::new_unchecked(layer_node_id);
 
 				responses.add(DocumentMessage::AddTransaction);
@@ -785,7 +791,7 @@ impl MessageHandler<DocumentMessage, DocumentMessageData<'_>> for DocumentMessag
 				let viewport_location = mouse.map_or(ipp.viewport_bounds.center() + ipp.viewport_bounds.top_left, |pos| pos.into());
 				let center_in_viewport = DAffine2::from_translation(document_to_viewport.inverse().transform_point2(viewport_location - ipp.viewport_bounds.top_left));
 
-				let layer_node_id = NodeId(generate_uuid());
+				let layer_node_id = NodeId::new();
 				let layer_id = LayerNodeIdentifier::new_unchecked(layer_node_id);
 
 				responses.add(DocumentMessage::AddTransaction);
@@ -1008,6 +1014,17 @@ impl MessageHandler<DocumentMessage, DocumentMessageData<'_>> for DocumentMessag
 					responses.add(GraphOperationMessage::BlendModeSet { layer, blend_mode });
 				}
 			}
+			DocumentMessage::SetGraphFadeArtwork { percentage } => {
+				self.graph_fade_artwork_percentage = percentage;
+				responses.add(FrontendMessage::UpdateGraphFadeArtwork { percentage });
+			}
+			DocumentMessage::SetNodePinned { node_id, pinned } => {
+				responses.add(DocumentMessage::StartTransaction);
+				responses.add(NodeGraphMessage::SetPinned { node_id, pinned });
+				responses.add(NodeGraphMessage::RunDocumentGraph);
+				responses.add(NodeGraphMessage::SelectedNodesUpdated);
+				responses.add(NodeGraphMessage::SendGraph);
+			}
 			DocumentMessage::SetOpacityForSelectedLayers { opacity } => {
 				let opacity = opacity.clamp(0., 1.);
 				for layer in self.network_interface.selected_nodes(&[]).unwrap().selected_layers_except_artboards(&self.network_interface) {
@@ -1026,6 +1043,10 @@ impl MessageHandler<DocumentMessage, DocumentMessageData<'_>> for DocumentMessag
 				if let Some(closure) = closure {
 					*closure(&mut self.snapping_state) = snapping_state;
 				}
+			}
+			DocumentMessage::SetToNodeOrLayer { node_id, is_layer } => {
+				responses.add(DocumentMessage::StartTransaction);
+				responses.add(NodeGraphMessage::SetToNodeOrLayer { node_id, is_layer });
 			}
 			DocumentMessage::SetViewMode { view_mode } => {
 				self.view_mode = view_mode;
@@ -1107,6 +1128,9 @@ impl MessageHandler<DocumentMessage, DocumentMessageData<'_>> for DocumentMessag
 				// TODO: Allow non layer nodes to have click targets
 				let layer_click_targets = click_targets
 					.into_iter()
+					.filter(|(node_id, _)|
+						// Ensure that the layer is in the document network to prevent logging an error
+						self.network_interface.network(&[]).unwrap().nodes.contains_key(node_id))
 					.filter_map(|(node_id, click_targets)| {
 						self.network_interface.is_layer(&node_id, &[]).then(|| {
 							let layer = LayerNodeIdentifier::new(node_id, &self.network_interface, &[]);
@@ -1202,11 +1226,19 @@ impl MessageHandler<DocumentMessage, DocumentMessageData<'_>> for DocumentMessag
 					self.network_interface.set_transform(transform, &self.breadcrumb_network_path);
 					let imports = self.network_interface.frontend_imports(&self.breadcrumb_network_path).unwrap_or_default();
 					let exports = self.network_interface.frontend_exports(&self.breadcrumb_network_path).unwrap_or_default();
+					let add_import = self.network_interface.frontend_import_modify(&self.breadcrumb_network_path);
+					let add_export = self.network_interface.frontend_export_modify(&self.breadcrumb_network_path);
+
 					responses.add(DocumentMessage::RenderRulers);
 					responses.add(DocumentMessage::RenderScrollbars);
 					responses.add(NodeGraphMessage::UpdateEdges);
 					responses.add(NodeGraphMessage::UpdateBoxSelection);
-					responses.add(FrontendMessage::UpdateImportsExports { imports, exports });
+					responses.add(FrontendMessage::UpdateImportsExports {
+						imports,
+						exports,
+						add_import,
+						add_export,
+					});
 					responses.add(FrontendMessage::UpdateNodeGraphTransform {
 						transform: Transform {
 							scale: transform.matrix2.x_axis.x,
@@ -1231,7 +1263,7 @@ impl MessageHandler<DocumentMessage, DocumentMessageData<'_>> for DocumentMessag
 				let bounds_rounded_dimensions = (bounds[1] - bounds[0]).round();
 
 				// Create an artboard and set its dimensions to the bounding box size and location
-				let node_id = NodeId(generate_uuid());
+				let node_id = NodeId::new();
 				let node_layer_id = LayerNodeIdentifier::new_unchecked(node_id);
 				let new_artboard_node = document_node_definitions::resolve_document_node_type("Artboard")
 					.expect("Failed to create artboard node")
@@ -1259,7 +1291,7 @@ impl MessageHandler<DocumentMessage, DocumentMessageData<'_>> for DocumentMessag
 					layer: node_layer_id,
 					transform: DAffine2::from_translation(bounds_rounded_dimensions / 2.),
 					transform_in: TransformIn::Local,
-					skip_rerender: true,
+					skip_rerender: false,
 				});
 			}
 			DocumentMessage::ZoomCanvasTo100Percent => {
@@ -1277,6 +1309,8 @@ impl MessageHandler<DocumentMessage, DocumentMessageData<'_>> for DocumentMessag
 				if let Some(bounds) = bounds {
 					responses.add(NavigationMessage::CanvasTiltSet { angle_radians: 0. });
 					responses.add(NavigationMessage::FitViewportToBounds { bounds, prevent_zoom_past_100: true });
+				} else {
+					warn!("Cannot zoom due to no bounds")
 				}
 			}
 			DocumentMessage::Noop => (),
@@ -1316,11 +1350,13 @@ impl MessageHandler<DocumentMessage, DocumentMessageData<'_>> for DocumentMessag
 				SelectedLayersRaise,
 				SelectedLayersRaiseToFront,
 				UngroupSelectedLayers,
-				ToggleSelectedVisibility,
 				ToggleSelectedLocked
 			);
 			if !self.graph_view_overlay_open {
-				select.extend(actions!(DocumentMessageDiscriminant; NudgeSelectedLayers));
+				select.extend(actions!(DocumentMessageDiscriminant;
+					NudgeSelectedLayers,
+					ToggleSelectedVisibility,
+				));
 			}
 			common.extend(select);
 		}
@@ -1654,7 +1690,7 @@ impl DocumentMessageHandler {
 			}
 		}
 		for font in fonts {
-			responses.add_front(FrontendMessage::TriggerFontLoad { font, is_default: false });
+			responses.add_front(FrontendMessage::TriggerFontLoad { font });
 		}
 	}
 
@@ -1803,69 +1839,11 @@ impl DocumentMessageHandler {
 				])
 				.widget_holder(),
 			Separator::new(SeparatorType::Unrelated).widget_holder(),
-			IconButton::new("ZoomIn", 24)
-				.tooltip("Zoom In")
-				.tooltip_shortcut(action_keys!(NavigationMessageDiscriminant::CanvasZoomIncrease))
-				.on_update(|_| NavigationMessage::CanvasZoomIncrease { center_on_mouse: false }.into())
-				.widget_holder(),
-			IconButton::new("ZoomOut", 24)
-				.tooltip("Zoom Out")
-				.tooltip_shortcut(action_keys!(NavigationMessageDiscriminant::CanvasZoomDecrease))
-				.on_update(|_| NavigationMessage::CanvasZoomDecrease { center_on_mouse: false }.into())
-				.widget_holder(),
-			IconButton::new("ZoomReset", 24)
-				.tooltip("Reset Tilt and Zoom to 100%")
-				.tooltip_shortcut(action_keys!(NavigationMessageDiscriminant::CanvasTiltResetAndZoomTo100Percent))
-				.on_update(|_| NavigationMessage::CanvasTiltResetAndZoomTo100Percent.into())
-				.disabled(self.document_ptz.tilt.abs() < 1e-4 && (self.document_ptz.zoom() - 1.).abs() < 1e-4)
-				.widget_holder(),
-			PopoverButton::new()
-				.popover_layout(vec![
-					LayoutGroup::Row {
-						widgets: vec![TextLabel::new("Canvas Navigation").bold(true).widget_holder()],
-					},
-					LayoutGroup::Row {
-						widgets: vec![TextLabel::new(
-							"
-								Interactive controls in this\n\
-								menu are coming soon.\n\
-								\n\
-								Pan:\n\
-								• Middle Click Drag\n\
-								\n\
-								Tilt:\n\
-								• Alt + Middle Click Drag\n\
-								\n\
-								Zoom:\n\
-								• Shift + Middle Click Drag\n\
-								• Ctrl + Scroll Wheel Roll
-							"
-							.trim(),
-						)
-						.multiline(true)
-						.widget_holder()],
-					},
-				])
-				.widget_holder(),
-			Separator::new(SeparatorType::Related).widget_holder(),
-			NumberInput::new(Some(self.navigation_handler.snapped_zoom(self.document_ptz.zoom()) * 100.))
-				.unit("%")
-				.min(0.000001)
-				.max(1000000.)
-				.tooltip("Document zoom within the viewport")
-				.on_update(|number_input: &NumberInput| {
-					NavigationMessage::CanvasZoomSet {
-						zoom_factor: number_input.value.unwrap() / 100.,
-					}
-					.into()
-				})
-				.increment_behavior(NumberInputIncrementBehavior::Callback)
-				.increment_callback_decrease(|_| NavigationMessage::CanvasZoomDecrease { center_on_mouse: false }.into())
-				.increment_callback_increase(|_| NavigationMessage::CanvasZoomIncrease { center_on_mouse: false }.into())
-				.widget_holder(),
 		];
 
-		let tilt_value = self.navigation_handler.snapped_tilt(self.document_ptz.tilt) / (std::f64::consts::PI / 180.);
+		widgets.extend(navigation_controls(&self.document_ptz, &self.navigation_handler, "Canvas"));
+
+		let tilt_value = self.navigation_handler.snapped_tilt(self.document_ptz.tilt()) / (std::f64::consts::PI / 180.);
 		if tilt_value.abs() > 0.00001 {
 			widgets.extend([
 				Separator::new(SeparatorType::Related).widget_holder(),
@@ -1886,7 +1864,7 @@ impl DocumentMessageHandler {
 						}
 						.into()
 					})
-					.tooltip("Document tilt within the viewport")
+					.tooltip("Canvas Tilt")
 					.on_update(|number_input: &NumberInput| {
 						NavigationMessage::CanvasTiltSet {
 							angle_radians: number_input.value.unwrap().to_radians(),
@@ -2037,15 +2015,15 @@ impl DocumentMessageHandler {
 				IconButton::new(if selection_all_locked { "PadlockLocked" } else { "PadlockUnlocked" }, 24)
 					.hover_icon(Some((if selection_all_locked { "PadlockUnlocked" } else { "PadlockLocked" }).into()))
 					.tooltip(if selection_all_locked { "Unlock Selected" } else { "Lock Selected" })
-					.tooltip_shortcut(action_keys!(NodeGraphMessageDiscriminant::ToggleSelectedLocked))
+					.tooltip_shortcut(action_keys!(DocumentMessageDiscriminant::ToggleSelectedLocked))
 					.on_update(|_| NodeGraphMessage::ToggleSelectedLocked.into())
 					.disabled(!has_selection)
 					.widget_holder(),
 				IconButton::new(if selection_all_visible { "EyeVisible" } else { "EyeHidden" }, 24)
 					.hover_icon(Some((if selection_all_visible { "EyeHide" } else { "EyeShow" }).into()))
 					.tooltip(if selection_all_visible { "Hide Selected" } else { "Show Selected" })
-					.tooltip_shortcut(action_keys!(NodeGraphMessageDiscriminant::ToggleSelectedVisibility))
-					.on_update(|_| NodeGraphMessage::ToggleSelectedVisibility.into())
+					.tooltip_shortcut(action_keys!(DocumentMessageDiscriminant::ToggleSelectedVisibility))
+					.on_update(|_| DocumentMessage::ToggleSelectedVisibility.into())
 					.disabled(!has_selection)
 					.widget_holder(),
 			],
@@ -2213,6 +2191,71 @@ impl<'a> ClickXRayIter<'a> {
 	}
 }
 
+pub fn navigation_controls(ptz: &PTZ, navigation_handler: &NavigationMessageHandler, tooltip_name: &str) -> [WidgetHolder; 6] {
+	[
+		IconButton::new("ZoomIn", 24)
+			.tooltip("Zoom In")
+			.tooltip_shortcut(action_keys!(NavigationMessageDiscriminant::CanvasZoomIncrease))
+			.on_update(|_| NavigationMessage::CanvasZoomIncrease { center_on_mouse: false }.into())
+			.widget_holder(),
+		IconButton::new("ZoomOut", 24)
+			.tooltip("Zoom Out")
+			.tooltip_shortcut(action_keys!(NavigationMessageDiscriminant::CanvasZoomDecrease))
+			.on_update(|_| NavigationMessage::CanvasZoomDecrease { center_on_mouse: false }.into())
+			.widget_holder(),
+		IconButton::new("ZoomReset", 24)
+			.tooltip("Reset Tilt and Zoom to 100%")
+			.tooltip_shortcut(action_keys!(NavigationMessageDiscriminant::CanvasTiltResetAndZoomTo100Percent))
+			.on_update(|_| NavigationMessage::CanvasTiltResetAndZoomTo100Percent.into())
+			.disabled(ptz.tilt().abs() < 1e-4 && (ptz.zoom() - 1.).abs() < 1e-4)
+			.widget_holder(),
+		PopoverButton::new()
+			.popover_layout(vec![
+				LayoutGroup::Row {
+					widgets: vec![TextLabel::new(format!("{tooltip_name} Navigation")).bold(true).widget_holder()],
+				},
+				LayoutGroup::Row {
+					widgets: vec![TextLabel::new({
+						let tilt = if tooltip_name == "Canvas" { "Tilt:\n• Alt + Middle Click Drag\n\n" } else { "" };
+						format!(
+							"
+							Interactive controls in this\n\
+							menu are coming soon.\n\
+							\n\
+							Pan:\n\
+							• Middle Click Drag\n\
+							\n\
+							{tilt}Zoom:\n\
+							• Shift + Middle Click Drag\n\
+							• Ctrl + Scroll Wheel Roll
+							"
+						)
+						.trim()
+					})
+					.multiline(true)
+					.widget_holder()],
+				},
+			])
+			.widget_holder(),
+		Separator::new(SeparatorType::Related).widget_holder(),
+		NumberInput::new(Some(navigation_handler.snapped_zoom(ptz.zoom()) * 100.))
+			.unit("%")
+			.min(0.000001)
+			.max(1000000.)
+			.tooltip(format!("{tooltip_name} Zoom"))
+			.on_update(|number_input: &NumberInput| {
+				NavigationMessage::CanvasZoomSet {
+					zoom_factor: number_input.value.unwrap() / 100.,
+				}
+				.into()
+			})
+			.increment_behavior(NumberInputIncrementBehavior::Callback)
+			.increment_callback_decrease(|_| NavigationMessage::CanvasZoomDecrease { center_on_mouse: false }.into())
+			.increment_callback_increase(|_| NavigationMessage::CanvasZoomIncrease { center_on_mouse: false }.into())
+			.widget_holder(),
+	]
+}
+
 impl<'a> Iterator for ClickXRayIter<'a> {
 	type Item = LayerNodeIdentifier;
 
@@ -2243,4 +2286,42 @@ impl<'a> Iterator for ClickXRayIter<'a> {
 		assert!(self.parent_targets.is_empty(), "The parent targets should always be empty (since we have left all layers)");
 		None
 	}
+}
+
+// TODO: Eventually remove this (probably starting late 2024)
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct OldDocumentMessageHandler {
+	// ============================================
+	// Fields that are saved in the document format
+	// ============================================
+	//
+	/// The node graph that generates this document's artwork.
+	/// It recursively stores its sub-graphs, so this root graph is the whole snapshot of the document content.
+	pub network: OldNodeNetwork,
+	/// List of the [`NodeId`]s that are currently selected by the user.
+	pub selected_nodes: SelectedNodes,
+	/// List of the [`LayerNodeIdentifier`]s that are currently collapsed by the user in the Layers panel.
+	/// Collapsed means that the expansion arrow isn't set to show the children of these layers.
+	pub collapsed: CollapsedLayers,
+	/// The name of the document, which is displayed in the tab and title bar of the editor.
+	pub name: String,
+	/// The full Git commit hash of the Graphite repository that was used to build the editor.
+	/// We save this to provide a hint about which version of the editor was used to create the document.
+	pub commit_hash: String,
+	/// The current pan, tilt, and zoom state of the viewport's view of the document canvas.
+	pub document_ptz: PTZ,
+	/// The current mode that the document is in, which starts out as Design Mode. This choice affects the editing behavior of the tools.
+	pub document_mode: DocumentMode,
+	/// The current view mode that the user has set for rendering the document within the viewport.
+	/// This is usually "Normal" but can be set to "Outline" or "Pixels" to see the canvas differently.
+	pub view_mode: ViewMode,
+	/// Sets whether or not all the viewport overlays should be drawn on top of the artwork.
+	/// This includes tool interaction visualizations (like the transform cage and path anchors/handles), the grid, and more.
+	pub overlays_visible: bool,
+	/// Sets whether or not the rulers should be drawn along the top and left edges of the viewport area.
+	pub rulers_visible: bool,
+	/// Sets whether or not the node graph is drawn (as an overlay) on top of the viewport area, or otherwise if it's hidden.
+	pub graph_view_overlay_open: bool,
+	/// The current user choices for snapping behavior, including whether snapping is enabled at all.
+	pub snapping_state: SnappingState,
 }

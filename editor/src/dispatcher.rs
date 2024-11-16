@@ -1,8 +1,7 @@
 use crate::messages::debug::utility_types::MessageLoggingVerbosity;
 use crate::messages::dialog::DialogMessageData;
+use crate::messages::portfolio::document::node_graph::document_node_definitions;
 use crate::messages::prelude::*;
-
-use graphene_core::text::Font;
 
 #[derive(Debug, Default)]
 pub struct Dispatcher {
@@ -134,9 +133,12 @@ impl Dispatcher {
 					// Display the menu bar at the top of the window
 					queue.add(MenuBarMessage::SendLayout);
 
-					// Load the default font
-					let font = Font::new(graphene_core::consts::DEFAULT_FONT_FAMILY.into(), graphene_core::consts::DEFAULT_FONT_STYLE.into());
-					queue.add(FrontendMessage::TriggerFontLoad { font, is_default: true });
+					// Send the information for tooltips and categories for each node/input.
+					queue.add(FrontendMessage::SendUIMetadata {
+						input_type_descriptions: Vec::new(),
+						node_descriptions: document_node_definitions::collect_node_descriptions(),
+						node_types: document_node_definitions::collect_node_types(),
+					});
 				}
 				Message::Batched(messages) => {
 					messages.iter().for_each(|message| self.handle_message(message.to_owned()));
@@ -191,10 +193,11 @@ impl Dispatcher {
 				Message::Portfolio(message) => {
 					let ipp = &self.message_handlers.input_preprocessor_message_handler;
 					let preferences = &self.message_handlers.preferences_message_handler;
+					let current_tool = &self.message_handlers.tool_message_handler.tool_state.tool_data.active_tool_type;
 
 					self.message_handlers
 						.portfolio_message_handler
-						.process_message(message, &mut queue, PortfolioMessageData { ipp, preferences });
+						.process_message(message, &mut queue, PortfolioMessageData { ipp, preferences, current_tool });
 				}
 				Message::Preferences(message) => {
 					self.message_handlers.preferences_message_handler.process_message(message, &mut queue, ());
@@ -236,8 +239,10 @@ impl Dispatcher {
 		list.extend(self.message_handlers.input_preprocessor_message_handler.actions());
 		list.extend(self.message_handlers.key_mapping_message_handler.actions());
 		list.extend(self.message_handlers.debug_message_handler.actions());
-		if self.message_handlers.portfolio_message_handler.active_document().is_some() {
-			list.extend(self.message_handlers.tool_message_handler.actions());
+		if let Some(document) = self.message_handlers.portfolio_message_handler.active_document() {
+			if !document.graph_view_overlay_open {
+				list.extend(self.message_handlers.tool_message_handler.actions());
+			}
 		}
 		list.extend(self.message_handlers.portfolio_message_handler.actions());
 		list
